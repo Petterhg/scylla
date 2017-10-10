@@ -32,6 +32,7 @@ def env_yaml():
     yamlDict['nodeKeyPath'] = os.environ.get('SCYLLA_NODE_KEY_PATH')
     yamlDict['nodeTrustStore'] = os.environ.get('SCYLLA_NODE_TRUST_STORE')
     yamlDict['downloadKeys'] = os.environ.get('SCYLLA_DOWNLOAD_KEYS')
+    yamlDict['downloadPath'] = os.environ.get('SCYLLA_DOWNLOAD_PATH')
     yamlDict['clusterName'] = os.environ.get('SCYLLA_CLUSTER_NAME')
     return yamlDict
         

@@ -25,17 +25,36 @@ class ScyllaSetup:
         home = os.environ['HOME']
         hostname = os.environ['HOST']
         if self.env_yaml['authentication'] is 'PasswordAuthenticator':
-            with open("%s/.cassandra/.cqlshrc" % home, "w") as cqlshrc:
+            with open("%s/.cqlshrc" % home, "w") as cqlshrc:
                 cqlshrc.write("[authentication]\nusername = %s\npassword = %s\n" 
                 %(self.env_yaml['username'], self.env_yaml['password']))
-            if self.env_yaml['clientSSL']:
-                with open("%s/.cassandra/.cqlshrc" % home, "a") as cqlshrc:
-                    cqlshrc.write("[connection]\nhostname = %s\nport = %s\nfactory = %s\n" %(hostname
-                
-            
+        
+        if self.env_yaml['authentication'] is not 'PasswordAuthenticator':
+            with open("%s/.cqlshrc" % home, "w") as cqlshrc:
+                cqlshrc.write("# No username and password set")
+        
         if self.env_yaml['clientSSL']:
-        with open("%s/.cassandra/.cqlshrc" % home, "w") as cqlshrc:
-            cqlshrc.write("[connection]\nhostname = %s\n" % hostname)
+            with open("%s/.cqlshrc" % home, "a") as cqlshrc:
+                cqlshrc.write("[connection]\nhostname = %s\nport = %s\nfactory = cqlshlib.ssl.ssl_transport_factory\n"                          %(hostname, self.env_yaml['cqlPort']))
+            if not self.env_yaml['downloadKeys']:
+                with open("%s/.cqlshrc" % home, "a") as cqlshrc:
+                    cqlshrc.write("[ssl]\ncertfile = %s\n" % self.env_yaml['clientCertPath'])
+            elif self.env_yaml['downloadKeys']:
+                with open("%s/.cqlshrc" % home, "a") as cqlshrc:
+                    cqlshrc.write("[ssl]\ncertfile = %s\n" % self.env_yaml['downloadPath']) 
+        if not self.env_yaml['clientSSL']:
+            with open("%s/.cqlshrc" % home, "a") as cqlshrc:
+                cqlshrc.write("[connection]\nhostname = %s\nport = %s\n" %(hostname, self.env_yaml['cqlPort']))
+
+    def scyllaYaml(self):
+        yamlDict = {}
+        yamlDict['cluster_name'] = self.env_yaml['clusterName']
+        yamlDict['num_tokens'] = 256
+        yamlDict['data_file_directories'] = ['/var/lib/scylla/data']
+        yamlDict['commitlog_directories'] = ['/var/lib/scylla/commitlog'] 
+
+    def cassandraProperties(self):
+
 
     def arguments(self):
         args = []
