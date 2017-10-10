@@ -2,6 +2,11 @@ import subprocess
 import logging
 import yaml
 import os
+import http.client
+import json
+import sys
+import socket
+
 import environmentcollector
 
 class ScyllaSetup:
@@ -46,49 +51,79 @@ class ScyllaSetup:
             with open("%s/.cqlshrc" % home, "a") as cqlshrc:
                 cqlshrc.write("[connection]\nhostname = %s\nport = %s\n" %(hostname, self.env_yaml['cqlPort']))
 
+    def setSeeds(self):
+        seedString = ""
+        masterIp = socket.gethostbyname('leader.mesos')
+        marathonPort = 8080
+        numOfSeeds = int(self.env_container['numberOfSeeds'])
+        conn = http.client.HTTPConnection(masterIp, marathonPort)
+        serviceName = os.environ['MARATHON_APP_ID']
+        conn.request("GET", "/v2/apps%s/tasks" %serviceName)
+        resp = conn.getresponse()
+        data = json.loads(r.read().decode('utf-8'))['tasks']
+        if numOfSeeds >= len(data):
+            print("Number of seeds must be less than total number of nodes")
+            sys.exit()
+        else:
+            for i in range(0, numOfSeeds)):
+                seedString += data[i]['ipAddresses'][0]['ipAddress']
+                if i < numOfSeeds-1:
+                    seedString += ","
+        return seedString
+
+    def setRack(self):
+        if self.env_cassandraprop['newRack']:
+            hostname = os.environ['HOST']
+            masterIp = socket.gethostbyname('leader.mesos')
+            marathonPort = 8080
+            conn = http.client.HTTPConnection(masterIp, marathonPort)
+            serviceName = os.environ['MARATHON_APP_ID']
+            conn.request("GET", "/v2/apps%s/tasks" %serviceName)
+            resp = conn.getresponse()
+            data = json.loads(r.read().decode('utf-8'))['tasks']
+            for i in range(0, len(data)):
+                if data[i]['ipAddresses'][0]['ipAddress'] == hostname:
+                   rackId = "rack"+str(i)
+        else:
+            rackId = "rack0"
+ 
+        return rackId
+             
     def scyllaYaml(self):
         yamlDict = {}
+        hostname = os.environ['HOST']
         yamlDict['cluster_name'] = self.env_yaml['clusterName']
         yamlDict['num_tokens'] = 256
         yamlDict['data_file_directories'] = ['/var/lib/scylla/data']
         yamlDict['commitlog_directories'] = ['/var/lib/scylla/commitlog'] 
+        yamlDict['commitlog_sync'] = 'periodic'
+        yamlDict['commitlog_sync_period_in_ms'] = 10000
+        yamlDict['commitlog_segment_size_in_mb'] = 32
+        seedString = self.setSeeds()
+        yamlDict['seed_provider'] = [{'class_name': 'org.apache.cassandra.locator.SimpleSeedProvider', 
+                                        'parameters': [{'seeds': seedString}]}]
+        yamlDict['listen_address'] = 'localhost'
+        yamlDict['broadcast_address'] = hostname
+        yamlDict['native_transport_port'] = 9042
+        yamlDict['read_request_timeout_in_ms'] = 5000
+        yamlDict['write_request_timeout_in_ms'] = 2000
+        yamlDict['endpoint_snitch'] = self.env_yaml['endpointSnitch']
+        yamlDict['rpc_address'] = 'localhost'
+        yamlDict['rpc_port'] = 9160
+        yamlDict['api_port'] = 10000
+        yamlDict['api_address'] = '127.0.0.1'
+        yamlDict['batch_size_warn_threshold_in_kb'] = self.env_yaml['batchWarnThreshold']
+        yamlDict['batch_size_fail_threshold_in_kb'] = self.env_yaml['batchFailThreshold']
+        yamlDict['authenticator'] = self.env_yaml['authenticator']
+        yamlDict['broadcast_rpc_address'] = hostname
+        yamlDict['experimental'] = self.env_setup['experimental']
+        
+        stream = file('/etc/scylla/scylla.yaml', 'w')
+        yaml.dump(yamlDict, stream)        
 
     def cassandraProperties(self):
-
-
-    def arguments(self):
-        args = []
-        if self._memory is not None:
-            args += [ "--memory %s" % self._memory ]
-        if self._smp is not None:
-            args += [ "--smp %s" % self._smp ]
-        if self._overprovisioned == "1":
-            args += [ "--overprovisioned" ]
-
-        if self._listenAddress is None:
-            self._listenAddress = subprocess.check_output(['hostname', '-i']).decode('ascii').strip()
-        if self._seeds is None:
-            if self._broadcastAddress is not None:
-                self._seeds = self._broadcastAddress
-            else:
-                self._seeds = self._listenAddress
-
-        args += [ "--listen-address %s" %self._listenAddress,
-                  "--rpc-address %s" %self._listenAddress,
-                  "--seed-provider-parameters seeds=%s" % self._seeds ]
-
-        if self._broadcastAddress is not None:
-            args += ["--broadcast-address %s" %self._broadcastAddress ]
-        if self._broadcastRpcAddress is not None:
-            args += [ "--broadcast-rpc-address %s" %self._broadcastRpcAddress ]
-
-        if self._apiAddress is not None:
-            args += ["--api-address %s" %self._apiAddress ]
-
-        if self._experimental == "1":
-            args += [ "--experimental=on" ]
-
-        args += ["--blocked-reactor-notify-ms 999999999"]
-
-        with open("/etc/scylla.d/docker.conf", "w") as cqlshrc:
-            cqlshrc.write("SCYLLA_DOCKER_ARGS=\"%s\"\n" % " ".join(args))
+        rackId = self.setRack()
+        with open('/etc/scylla/cassandra-rackdc.properties', 'w') as outfile:
+            outfile.write("dc=%s\nrack=%s\nprefer_local=false" 
+                %(self.env_cassandraprop['dataCenter'], rackId))
+             

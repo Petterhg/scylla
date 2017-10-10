@@ -24,7 +24,7 @@ ADD commandlineparser.py /commandlineparser.py
 ADD docker-entrypoint.py /docker-entrypoint.py
 
 # Install Scylla:
-RUN curl http://downloads.scylladb.com.s3.amazonaws.com/rpm/centos/scylla-1.7.repo -o /etc/yum.repos.d/scylla.repo && \
+RUN curl http://downloads.scylladb.com.s3.amazonaws.com/rpm/centos/scylla-2.0.repo -o /etc/yum.repos.d/scylla.repo && \
     yum -y install epel-release && \
     yum -y clean expire-cache && \
     yum -y update && \

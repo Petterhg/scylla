@@ -15,7 +15,7 @@ def env_container():
 
 def env_yaml():
     yamlDict = {}
-    yamlDict['endpointSnitch'] = os.environ.get('SCYLLA_ENDPOINTSNITCH')
+    yamlDict['endpointSnitch'] = os.environ.get('SCYLLA_ENDPOINT_SNITCH')
     yamlDict['cqlPort'] = os.environ.get('SCYLLA_CQL_PORT')
     yamlDict['thriftPort'] = os.environ.get('SCYLLA_THRIFT_PORT')
     yamlDict['batchWarnThreshold'] = os.environ.get('SCYLLA_BATCH_SIZE_WARN')
