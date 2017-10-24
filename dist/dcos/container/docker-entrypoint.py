@@ -9,7 +9,6 @@ logging.basicConfig(stream=sys.stdout, level=logging.DEBUG, format="%(message)s"
 try:
     setup = scyllasetup.ScyllaSetup() 
     setup.developerMode()
-    setup.cpuSet()
     setup.io()
     setup.cqlshrc()
     setup.scyllaYaml()

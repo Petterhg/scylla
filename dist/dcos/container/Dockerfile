@@ -1,7 +1,5 @@
 FROM centos:7
 
-MAINTAINER Avi Kivity <avi@cloudius-systems.com>
-
 #enable systemd
 ENV container docker
 VOLUME [ "/sys/fs/cgroup" ]
@@ -18,11 +16,6 @@ ADD etc/supervisord.conf.d/scylla-jmx.conf /etc/supervisord.conf.d/scylla-jmx.co
 ADD scylla-service.sh /scylla-service.sh
 ADD scylla-jmx-service.sh /scylla-jmx-service.sh
 
-# Docker image startup scripts:
-ADD scyllasetup.py /scyllasetup.py
-ADD commandlineparser.py /commandlineparser.py
-ADD docker-entrypoint.py /docker-entrypoint.py
-
 # Install Scylla:
 RUN curl http://downloads.scylladb.com.s3.amazonaws.com/rpm/centos/scylla-2.0.repo -o /etc/yum.repos.d/scylla.repo && \
     yum -y install epel-release && \
@@ -36,6 +29,11 @@ RUN curl http://downloads.scylladb.com.s3.amazonaws.com/rpm/centos/scylla-2.0.re
     mkdir -p /etc/supervisor.conf.d && \
     mkdir -p /var/log/scylla && \
     chown -R scylla.scylla /var/lib/scylla
+
+# Docker image startup scripts:
+ADD scyllasetup.py /scyllasetup.py
+ADD environmentcollector.py /environmentcollector.py
+ADD docker-entrypoint.py /docker-entrypoint.py
 
 ENTRYPOINT ["/docker-entrypoint.py"]
 
