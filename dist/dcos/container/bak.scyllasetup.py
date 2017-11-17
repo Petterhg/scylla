@@ -99,50 +99,61 @@ class ScyllaSetup:
              
     def scyllaYaml(self):
         logging.info("Starting the scylla.yaml configuration...")
-        args = []
+        yamlDict = {}
         hostname = os.environ['HOST']
         mesosSandbox = os.environ['MESOS_SANDBOX']
         seedString = self.setSeeds()
 
-        args += ["--cluster-name %s" % self.env_yaml['clusterName']] 
-        args += ["--endpoint-snitch %s" % self.env_yaml['endpointSnitch']]
-        args += ["--seed-provider-parameters seeds=%s" % seedString]
-        args += ["--batch-size-warn-threshold-in-kb %s" % self.env_yaml['batchWarnThreshold']]
-        args += ["--batch_size_fail_threshold_in_kb %s" % self.env_yaml['batchFailThreshold']]
-        args += ["--broadcast_address %s" % hostname]
-        args += ["--partitioner %s" % self.env_yaml['partitioner']]
-        args += ["--broadcast-rpc-address %s" hostname]
-        args += ["--experimental %s" self.env_setup['experimental']]
-        
-
-        if self.env_yaml['nodeSSL']:
-            if self.env_yaml['downloadKeys']:
-                args += ["--server-encryption-options internode_encryption=%s certificate=%s keyfile=%s truststore=%s",
-                            %(self.env_yaml['nodeLevel'], mesosSandbox, mesosSandbox, mesosSandbox)]
-            else:
-                args += ["--server-encryption-options internode_encryption=%s certificate=%s keyfile=%s truststore=%s",
-                            %(self.env_yaml['nodeLevel'], self.env_yaml['nodeCertPath'], self.env_yaml['nodeKeyPath'], 
-                                self.env_yaml['nodeTrustStore'])]
-        if self.env_yaml['clientSSL']:
-            if self.env_yaml['downloadKeys']:
-                args += ["--client-encryption-options enabled=true certificate=%s/scylladb.crt keyfile=%s/scylladb.key",
-                            %(mesosSandbox, mesosSandbox)]
-            else:
-                args += ["--client-encryption-options enabled=true certificate=%s/scylladb.crt keyfile=%s/scylladb.key",
-                            %(self.env_yaml['clientCertPath'], self.env_yaml['clientKeyPath'])]
-
-        args += ["--load-balance %s" % self.env_yaml['cqlLoadBalance']]
-
+        yamlDict['cluster_name'] = self.env_yaml['clusterName']
+        yamlDict['partitioner'] = 'org.apache.cassandra.dht.Murmur3Partitioner'
+        yamlDict['num_tokens'] = 256
+        yamlDict['data_file_directories'] = ['/var/lib/scylla/data']
+        yamlDict['commitlog_directory'] = '/var/lib/scylla/commitlog'
+        yamlDict['commitlog_sync'] = 'periodic'
+        yamlDict['commitlog_sync_period_in_ms'] = 10000
+        yamlDict['commitlog_segment_size_in_mb'] = 32
+        yamlDict['seed_provider'] = [{'class_name': 'org.apache.cassandra.locator.SimpleSeedProvider', 
+                                        'parameters': [{'seeds': seedString}]}]
         yamlDict['broadcast_address'] = hostname
         yamlDict['native_transport_port'] = 9042
         yamlDict['read_request_timeout_in_ms'] = 5000
         yamlDict['write_request_timeout_in_ms'] = 2000
+        yamlDict['endpoint_snitch'] = self.env_yaml['endpointSnitch']
+        #yamlDict['rpc_address'] = hostname
         yamlDict['rpc_port'] = 9160
+        #yamlDict['api_port'] = 10000
+        #yamlDict['api_address'] = '127.0.0.1'
+        yamlDict['batch_size_warn_threshold_in_kb'] = self.env_yaml['batchWarnThreshold']
+        yamlDict['batch_size_fail_threshold_in_kb'] = self.env_yaml['batchFailThreshold']
         yamlDict['authenticator'] = self.env_yaml['authenticator']
         yamlDict['broadcast_rpc_address'] = hostname
         yamlDict['experimental'] = self.env_setup['experimental']
         
-                 
+        if self.env_yaml['nodeSSL']:
+            if self.env_yaml['downloadKeys']:
+                yamlDict['server_encryption_options'] = {'internode_encryption': self.env_yaml['nodeLevel'],
+                                                        'certificate': '%s/scylladb.crt' %mesosSandbox,
+                                                        'keyfile': '%s/scylladb.key' %mesosSandbox,
+                                                        'truststore': '%s/ca-scylladb.pem' %mesosSandbox
+                                                        }
+            else:
+                yamlDict['server_encryption_options'] = {'internode_encryption': self.env_yaml['nodeLevel'],
+                                                        'certificate': self.env_yaml['nodeCertPath'],
+                                                        'keyfile': self.env_yaml['nodeKeyPath'],
+                                                        'truststore': self.env_yaml['nodeTrustStore']
+                                                        }
+        if self.env_yaml['clientSSL']:
+            if self.env_yaml['downloadKeys']:
+                yamlDict['client_encryption_options'] = {'enabled': 'true',
+                                                        'certificate': '%s/scylladb.crt' %mesosSandbox,
+                                                        'keyfile': '%s/scylladb.key' %mesosSandbox
+                                                        }
+            else:
+                yamlDict['client_encryption_options'] = {'enabled': 'true',
+                                                        'certificate': self.env_yaml['clientCertPath'],
+                                                        'keyfile': self.env_yaml['clientKeyPath']
+                                                        }
+        
         stream = open('/etc/scylla/scylla.yaml', 'w')
         yaml.dump(yamlDict, stream)
         with open('/etc/scylla/scylla.yaml', 'r') as fin:
