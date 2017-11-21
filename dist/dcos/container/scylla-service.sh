@@ -4,4 +4,6 @@
 
 export SCYLLA_HOME SCYLLA_CONF
 
-exec /usr/bin/scylla $SCYLLA_ARGS $SEASTAR_IO $DEV_MODE $CPUSET --blocked-reactor-notify-ms 999999999
+echo $SCYLLA_ARGS $SEASTAR_IO $DEV_MODE $CPUSET $SCYLLA_DOCKER_ARGS > ~/arguments.txt
+
+exec /usr/bin/scylla $SCYLLA_ARGS $SEASTAR_IO $DEV_MODE $CPUSET $SCYLLA_DOCKER_ARGS

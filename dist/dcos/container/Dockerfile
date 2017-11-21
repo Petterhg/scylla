@@ -28,7 +28,9 @@ RUN curl http://downloads.scylladb.com.s3.amazonaws.com/rpm/centos/scylla-2.0.re
     cat /scylla_bashrc >> /etc/bashrc && \
     mkdir -p /etc/supervisor.conf.d && \
     mkdir -p /var/log/scylla && \
-    chown -R scylla.scylla /var/lib/scylla
+    chown -R scylla.scylla /var/lib/scylla && \
+    mkdir -p /etc/scylla/keys/{client,node} && \
+    chmod 644 -R /etc/scylla/keys
 
 # Docker image startup scripts:
 ADD scyllasetup.py /scyllasetup.py

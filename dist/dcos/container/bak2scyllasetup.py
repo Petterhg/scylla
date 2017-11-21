@@ -33,29 +33,29 @@ class ScyllaSetup:
     def cqlshrc(self):
         logging.info("Setting up cqlshrc file...")
         home = os.environ['HOME']
-        hostname = subprocess.check_output(['hostname', '-i']).decode('ascii').strip() 
-        if self.env_yaml['authenticator'] == 'PasswordAuthenticator':
+        hostname = os.environ['HOST']
+        if self.env_yaml['authenticator'] is 'PasswordAuthenticator':
             with open("%s/.cqlshrc" % home, "w") as cqlshrc:
                 cqlshrc.write("[authenticator]\nusername = %s\npassword = %s\n" 
                 %(self.env_yaml['username'], self.env_yaml['password']))
         
-        if self.env_yaml['authenticator'] != 'PasswordAuthenticator':
+        if self.env_yaml['authenticator'] is not 'PasswordAuthenticator':
             with open("%s/.cqlshrc" % home, "w") as cqlshrc:
                 cqlshrc.write("# No username and password set\n")
         
         if self.env_yaml['clientSSL']:
             with open("%s/.cqlshrc" % home, "a") as cqlshrc:
-                cqlshrc.write("[connection]\nhostname = %s\nport = 9042\nfactory = cqlshlib.ssl.ssl_transport_factory\n"                          %hostname)
+                cqlshrc.write("[connection]\nhostname = %s\nport = %s\nfactory = cqlshlib.ssl.ssl_transport_factory\n"                          %(hostname, self.env_yaml['cqlPort']))
             if not self.env_yaml['downloadKeys']:
                 with open("%s/.cqlshrc" % home, "a") as cqlshrc:
-                    cqlshrc.write("[ssl]\ncertfile = /etc/scylla/keys/client/scylladb.crt\n")
+                    cqlshrc.write("[ssl]\ncertfile = %s\n" % self.env_yaml['clientCertPath'])
             elif self.env_yaml['downloadKeys']:
                 mesosSandbox = os.environ['MESOS_SANDBOX']
                 with open("%s/.cqlshrc" % home, "a") as cqlshrc:
                     cqlshrc.write("[ssl]\ncertfile = %s/scylladb.crt\n" %mesosSandbox) 
         if not self.env_yaml['clientSSL']:
             with open("%s/.cqlshrc" % home, "a") as cqlshrc:
-                cqlshrc.write("[connection]\nhostname = %s\nport = 9042\n" %hostname)
+                cqlshrc.write("[connection]\nhostname = %s\nport = %s\n" %(hostname, self.env_yaml['cqlPort']))
 
     def setSeeds(self):
         logging.info("Determining seed nodes...")
@@ -100,76 +100,52 @@ class ScyllaSetup:
     def scyllaYaml(self):
         logging.info("Starting the scylla.yaml configuration...")
         args = []
-        yamlDict = {}
         hostname = os.environ['HOST']
         mesosSandbox = os.environ['MESOS_SANDBOX']
         seedString = self.setSeeds()
-         
-        # --------- TO YAML ---------
-        yamlDict['cluster_name'] = self.env_yaml['clusterName']
-        yamlDict['partitioner'] = self.env_yaml['partitioner'] 
-        yamlDict['data_file_directories'] = ['/var/lib/scylla/data']
-        yamlDict['commitlog_directory'] = '/var/lib/scylla/commitlog'
-        yamlDict['endpoint_snitch'] = self.env_yaml['endpointSnitch']
-        yamlDict['batch_size_warn_threshold_in_kb'] = self.env_yaml['batchWarnThreshold']
-        yamlDict['batch_size_fail_threshold_in_kb'] = self.env_yaml['batchFailThreshold']
-        yamlDict['authenticator'] = self.env_yaml['authenticator']
-        if self.env_yaml['nodeSSL']:
-            if self.env_yaml['downloadKeys']:
-                yamlDict['server_encryption_options'] = {'internode_encryption': self.env_yaml['nodeLevel'],
-                                                        'certificate': '%s/scylladb.crt' %mesosSandbox,
-                                                        'keyfile': '%s/scylladb.key' %mesosSandbox,
-                                                        'truststore': '%s/ca-scylladb.pem' %mesosSandbox
-                                                        }
-            else:
-                yamlDict['server_encryption_options'] = {'internode_encryption': self.env_yaml['nodeLevel'],
-                                                        'certificate': '/etc/scylla/keys/node/scylladb.crt',
-                                                        'keyfile': '/etc/scylla/keys/node/scylladb.key',
-                                                        'truststore': '/etc/scylla/keys/node/ca-scylladb.pem'
-                                                        }
-        if self.env_yaml['clientSSL']:
-            if self.env_yaml['downloadKeys']:
-                yamlDict['client_encryption_options'] = {'enabled': 'true',
-                                                        'certificate': '%s/scylladb.crt' %mesosSandbox,
-                                                        'keyfile': '%s/scylladb.key' %mesosSandbox
-                                                        }
-            else:
-                yamlDict['client_encryption_options'] = {'enabled': 'true',
-                                                        'certificate': '/etc/scylla/keys/client/scylladb.crt',
-                                                        'keyfile': '/etc/scylla/keys/client/scylladb.key'
-                                                        }
-        yamlDict['commitlog_sync'] = 'periodic'
-        yamlDict['commitlog_sync_period_in_ms'] = 10000
-        yamlDict['commitlog_segment_size_in_mb'] = 32
-        yamlDict['native_transport_port'] = 9042
-        yamlDict['read_request_timeout_in_ms'] = 5000
-        yamlDict['write_request_timeout_in_ms'] = 2000
-        yamlDict['api_port'] = 10000
-        yamlDict['api_address'] = '127.0.0.1'
-        yamlDict['murmur3_partitioner_ignore_msb_bits'] = 12
-        yamlDict['api_ui_dir'] = '/usr/lib/scylla/swagger-ui/dist/'
-        yamlDict['api_doc_dir'] = '/usr/lib/scylla/api/api-doc/'
-        stream = open('/etc/scylla/scylla.yaml', 'w')
-        yaml.dump(yamlDict, stream)
-        
-        # --------- TO CMD ---------
-        listen_address = subprocess.check_output(['hostname', '-i']).decode('ascii').strip()
-        args += ["--listen-address %s" %listen_address]
-        args += ["--rpc-address %s" %listen_address]
 
-        if self.env_setup["overprovisioned"]:
-            args += ["--overprovisioned"]
-       
-        args += ["--smp %d" % int(self.env_container["cpus"])]
-        args += ["--memory %dM" % int(self.env_container["mem"])]         
+        args += ["--cluster-name %s" % self.env_yaml['clusterName']] 
+        args += ["--endpoint-snitch %s" % self.env_yaml['endpointSnitch']]
         args += ["--seed-provider-parameters seeds=%s" % seedString]
+        args += ["--batch-size-warn-threshold-in-kb %s" % self.env_yaml['batchWarnThreshold']]
+        args += ["--batch-size-fail-threshold-in-kb %s" % self.env_yaml['batchFailThreshold']]
         args += ["--broadcast-address %s" % hostname]
+        args += ["--partitioner %s" % self.env_yaml['partitioner']]
         args += ["--broadcast-rpc-address %s" % hostname]
+        args += ["--authenticator %s" % self.env_yaml['authenticator']]       
  
         if self.env_setup['experimental']:
-            args += ["--experimental=on"]
+            args += ["--experimental 1"]
+        else:
+            args += ["--experimental 0"]
         
+        if self.env_yaml['nodeSSL']:
+            if self.env_yaml['downloadKeys']:
+                args += ["--server-encryption-options internode_encryption=%s certificate=%s/scylladb.crt keyfile=%s/scylladb.key truststore=%s/ca-scylladb.pem"
+                            %(self.env_yaml['nodeLevel'], mesosSandbox, mesosSandbox, mesosSandbox)]
+            else:
+                args += ["--server-encryption-options internode_encryption=%s certificate=%s keyfile=%s truststore=%s"
+                            %(self.env_yaml['nodeLevel'], self.env_yaml['nodeCertPath'], self.env_yaml['nodeKeyPath'], 
+                                self.env_yaml['nodeTrustStore'])]
+
+        if self.env_yaml['clientSSL']:
+            if self.env_yaml['downloadKeys']:
+                args += ["--client-encryption-options enabled=true certificate=%s/scylladb.crt keyfile=%s/scylladb.key"
+                            %(mesosSandbox, mesosSandbox)]
+            else:
+                args += ["--client-encryption-options enabled=true certificate=%s/scylladb.crt keyfile=%s/scylladb.key"
+                            %(self.env_yaml['clientCertPath'], self.env_yaml['clientKeyPath'])]
+
+        args += ["--load-balance %s" % self.env_yaml['cqlLoadBalance']]
         args += ["--blocked-reactor-notify-ms 999999999"]
+        
+        if self.env_setup["overprovisioned"]:
+            args += ["--overprovisioned 1"]
+        else:
+            args += ["--overprovisioned 0"]
+        
+        args += ["--smp %d" % int(self.env_container["cpus"])]
+        args += ["--memory %dM" % int(self.env_container["mem"])]         
               
         with open("/etc/scylla.d/docker.conf", "w") as cqlshrc:
             cqlshrc.write("SCYLLA_DOCKER_ARGS=\"%s\"\n" % " ".join(args))
