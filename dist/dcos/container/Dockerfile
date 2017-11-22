@@ -22,7 +22,7 @@ RUN curl http://downloads.scylladb.com.s3.amazonaws.com/rpm/centos/scylla-2.0.re
     yum -y clean expire-cache && \
     yum -y update && \
     yum -y remove boost-thread boost-system && \
-    yum -y install scylla hostname supervisor && \
+    yum -y install scylla hostname supervisor jq && \
     yum clean all && \
     yum -y install python34 python34-PyYAML && \
     cat /scylla_bashrc >> /etc/bashrc && \
@@ -36,6 +36,8 @@ RUN curl http://downloads.scylladb.com.s3.amazonaws.com/rpm/centos/scylla-2.0.re
 ADD scyllasetup.py /scyllasetup.py
 ADD environmentcollector.py /environmentcollector.py
 ADD docker-entrypoint.py /docker-entrypoint.py
+ADD system_auth_replicator.sh /system_auth_replicator.sh
+RUN chmod a+x /system_auth_replicator.sh
 
 ENTRYPOINT ["/docker-entrypoint.py"]
 

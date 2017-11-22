@@ -114,6 +114,11 @@ class ScyllaSetup:
         yamlDict['batch_size_warn_threshold_in_kb'] = self.env_yaml['batchWarnThreshold']
         yamlDict['batch_size_fail_threshold_in_kb'] = self.env_yaml['batchFailThreshold']
         yamlDict['authenticator'] = self.env_yaml['authenticator']
+        yamlDict['authorizer'] = 'AllowAllAuthorizer'
+    
+        if self.env_yaml['authenticator'] == 'PasswordAuthenticator':
+            yamlDict['authorizer'] = 'CassandraAuthorizer'
+ 
         if self.env_yaml['nodeSSL']:
             if self.env_yaml['downloadKeys']:
                 yamlDict['server_encryption_options'] = {'internode_encryption': self.env_yaml['nodeLevel'],
