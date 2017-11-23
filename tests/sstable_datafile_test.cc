@@ -38,6 +38,7 @@
 #include "sstables/compaction_manager.hh"
 #include "tmpdir.hh"
 #include "dht/i_partitioner.hh"
+#include "dht/murmur3_partitioner.hh"
 #include "range.hh"
 #include "partition_slice_builder.hh"
 #include "sstables/compaction_strategy_impl.hh"
@@ -998,12 +999,12 @@ static future<std::vector<sstables::shared_sstable>> open_sstables(schema_ptr s,
 }
 
 // mutation_reader for sstable keeping all the required objects alive.
-static ::mutation_reader sstable_reader(shared_sstable sst, schema_ptr s) {
+static mutation_reader sstable_reader(shared_sstable sst, schema_ptr s) {
     return sst->as_mutation_source()(s);
 
 }
 
-static ::mutation_reader sstable_reader(shared_sstable sst, schema_ptr s, const dht::partition_range& pr) {
+static mutation_reader sstable_reader(shared_sstable sst, schema_ptr s, const dht::partition_range& pr) {
     return sst->as_mutation_source()(s, pr);
 }
 
@@ -1258,7 +1259,9 @@ static future<std::vector<unsigned long>> compact_sstables(std::vector<unsigned 
 
         if (strategy == compaction_strategy_type::size_tiered) {
             // Calling function that will return a list of sstables to compact based on size-tiered strategy.
-            auto sstables_to_compact = size_tiered_most_interesting_bucket(*sstables);
+            int min_threshold = cf->schema()->min_compaction_threshold();
+            int max_threshold = cf->schema()->max_compaction_threshold();
+            auto sstables_to_compact = sstables::size_tiered_compaction_strategy::most_interesting_bucket(*sstables, min_threshold, max_threshold);
             // We do expect that all candidates were selected for compaction (in this case).
             BOOST_REQUIRE(sstables_to_compact.size() == sstables->size());
             return sstables::compact_sstables(std::move(sstables_to_compact), *cf, new_sstable,
@@ -1270,7 +1273,8 @@ static future<std::vector<unsigned long>> compact_sstables(std::vector<unsigned 
                 column_family_test(cf).add_sstable(sst);
             }
             auto candidates = get_candidates_for_leveled_strategy(*cf);
-            leveled_manifest manifest = leveled_manifest::create(*cf, candidates, 1);
+            sstables::size_tiered_compaction_strategy_options stcs_options;
+            leveled_manifest manifest = leveled_manifest::create(*cf, candidates, 1, stcs_options);
             std::vector<stdx::optional<dht::decorated_key>> last_compacted_keys(leveled_manifest::MAX_LEVELS);
             std::vector<int> compaction_counter(leveled_manifest::MAX_LEVELS);
             auto candidate = manifest.get_compaction_candidates(last_compacted_keys, compaction_counter);
@@ -1310,7 +1314,7 @@ static future<> check_compacted_sstables(unsigned long generation, std::vector<u
         auto reader = sstable_reader(sst, s); // reader holds sst and s alive.
         auto keys = make_lw_shared<std::vector<partition_key>>();
 
-        return do_with(std::move(reader), [generations, s, keys] (::mutation_reader& reader) {
+        return do_with(std::move(reader), [generations, s, keys] (mutation_reader& reader) {
             return do_for_each(*generations, [&reader, s, keys] (unsigned long generation) mutable {
                 return reader().then([generation, keys] (streamed_mutation_opt m) {
                     BOOST_REQUIRE(m);
@@ -1706,18 +1710,23 @@ static range<dht::token> create_token_range_from_keys(sstring start_key, sstring
     return range<dht::token>::make(start, end);
 }
 
-static std::vector<std::pair<sstring, dht::token>> token_generation_for_current_shard(unsigned tokens_to_generate) {
+namespace dht {
+    extern std::unique_ptr<i_partitioner> default_partitioner;
+}
+
+static std::vector<std::pair<sstring, dht::token>> token_generation_for_shard(unsigned tokens_to_generate, unsigned shard,
+        unsigned ignore_msb = 0, unsigned smp_count = smp::count) {
     unsigned tokens = 0;
     unsigned key_id = 0;
     std::vector<std::pair<sstring, dht::token>> key_and_token_pair;
 
     key_and_token_pair.reserve(tokens_to_generate);
-    dht::set_global_partitioner(to_sstring("org.apache.cassandra.dht.Murmur3Partitioner"));
+    dht::default_partitioner = std::make_unique<dht::murmur3_partitioner>(smp_count, ignore_msb);
 
     while (tokens < tokens_to_generate) {
         sstring key = to_sstring(key_id++);
         dht::token token = create_token_from_key(key);
-        if (engine().cpu_id() != dht::global_partitioner().shard_of(token)) {
+        if (shard != dht::global_partitioner().shard_of(token)) {
             continue;
         }
         tokens++;
@@ -1730,6 +1739,10 @@ static std::vector<std::pair<sstring, dht::token>> token_generation_for_current_
     });
 
     return key_and_token_pair;
+}
+
+static std::vector<std::pair<sstring, dht::token>> token_generation_for_current_shard(unsigned tokens_to_generate) {
+    return token_generation_for_shard(tokens_to_generate, engine().cpu_id());
 }
 
 static void add_sstable_for_leveled_test(lw_shared_ptr<column_family>& cf, int64_t gen, uint64_t fake_data_size,
@@ -1808,7 +1821,8 @@ SEASTAR_TEST_CASE(leveled_01) {
     BOOST_REQUIRE(sstable_overlaps(cf, 1, 2) == true);
 
     auto candidates = get_candidates_for_leveled_strategy(*cf);
-    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb);
+    sstables::size_tiered_compaction_strategy_options stcs_options;
+    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb, stcs_options);
     BOOST_REQUIRE(manifest.get_level_size(0) == 2);
     std::vector<stdx::optional<dht::decorated_key>> last_compacted_keys(leveled_manifest::MAX_LEVELS);
     std::vector<int> compaction_counter(leveled_manifest::MAX_LEVELS);
@@ -1867,7 +1881,8 @@ SEASTAR_TEST_CASE(leveled_02) {
     BOOST_REQUIRE(sstable_overlaps(cf, 2, 3) == false);
 
     auto candidates = get_candidates_for_leveled_strategy(*cf);
-    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb);
+    sstables::size_tiered_compaction_strategy_options stcs_options;
+    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb, stcs_options);
     BOOST_REQUIRE(manifest.get_level_size(0) == 3);
     std::vector<stdx::optional<dht::decorated_key>> last_compacted_keys(leveled_manifest::MAX_LEVELS);
     std::vector<int> compaction_counter(leveled_manifest::MAX_LEVELS);
@@ -1927,7 +1942,8 @@ SEASTAR_TEST_CASE(leveled_03) {
 
     auto max_sstable_size_in_mb = 1;
     auto candidates = get_candidates_for_leveled_strategy(*cf);
-    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb);
+    sstables::size_tiered_compaction_strategy_options stcs_options;
+    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb, stcs_options);
     BOOST_REQUIRE(manifest.get_level_size(0) == 2);
     BOOST_REQUIRE(manifest.get_level_size(1) == 2);
     std::vector<stdx::optional<dht::decorated_key>> last_compacted_keys(leveled_manifest::MAX_LEVELS);
@@ -1992,7 +2008,8 @@ SEASTAR_TEST_CASE(leveled_04) {
     BOOST_REQUIRE(sstable_overlaps(cf, 2, 4) == true);
 
     auto candidates = get_candidates_for_leveled_strategy(*cf);
-    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb);
+    sstables::size_tiered_compaction_strategy_options stcs_options;
+    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb, stcs_options);
     BOOST_REQUIRE(manifest.get_level_size(0) == 1);
     BOOST_REQUIRE(manifest.get_level_size(1) == 2);
     BOOST_REQUIRE(manifest.get_level_size(2) == 1);
@@ -2063,7 +2080,8 @@ SEASTAR_TEST_CASE(leveled_06) {
     BOOST_REQUIRE(cf->get_sstables()->size() == 1);
 
     auto candidates = get_candidates_for_leveled_strategy(*cf);
-    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb);
+    sstables::size_tiered_compaction_strategy_options stcs_options;
+    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb, stcs_options);
     BOOST_REQUIRE(manifest.get_level_size(0) == 0);
     BOOST_REQUIRE(manifest.get_level_size(1) == 1);
     BOOST_REQUIRE(manifest.get_level_size(2) == 0);
@@ -2094,7 +2112,8 @@ SEASTAR_TEST_CASE(leveled_07) {
         add_sstable_for_leveled_test(cf, i, 1024*1024, /*level*/0, "a", "a", i /* max timestamp */);
     }
     auto candidates = get_candidates_for_leveled_strategy(*cf);
-    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, 1);
+    sstables::size_tiered_compaction_strategy_options stcs_options;
+    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, 1, stcs_options);
     std::vector<stdx::optional<dht::decorated_key>> last_compacted_keys(leveled_manifest::MAX_LEVELS);
     std::vector<int> compaction_counter(leveled_manifest::MAX_LEVELS);
     auto desc = manifest.get_compaction_candidates(last_compacted_keys, compaction_counter);
@@ -2136,7 +2155,8 @@ SEASTAR_TEST_CASE(leveled_invariant_fix) {
     add_sstable_for_leveled_test(cf, sstables_no, sstable_max_size, 1, key_and_token_pair[1].first, max_key);
 
     auto candidates = get_candidates_for_leveled_strategy(*cf);
-    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, 1);
+    sstables::size_tiered_compaction_strategy_options stcs_options;
+    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, 1, stcs_options);
     std::vector<stdx::optional<dht::decorated_key>> last_compacted_keys(leveled_manifest::MAX_LEVELS);
     std::vector<int> compaction_counter(leveled_manifest::MAX_LEVELS);
 
@@ -2178,9 +2198,10 @@ SEASTAR_TEST_CASE(leveled_stcs_on_L0) {
 
     std::vector<stdx::optional<dht::decorated_key>> last_compacted_keys(leveled_manifest::MAX_LEVELS);
     std::vector<int> compaction_counter(leveled_manifest::MAX_LEVELS);
+    sstables::size_tiered_compaction_strategy_options stcs_options;
 
     {
-        leveled_manifest manifest = leveled_manifest::create(*cf, candidates, sstable_max_size_in_mb);
+        leveled_manifest manifest = leveled_manifest::create(*cf, candidates, sstable_max_size_in_mb, stcs_options);
         BOOST_REQUIRE(!manifest.worth_promoting_L0_candidates(manifest.get_level(0)));
         auto candidate = manifest.get_compaction_candidates(last_compacted_keys, compaction_counter);
         BOOST_REQUIRE(candidate.level == 0);
@@ -2191,7 +2212,7 @@ SEASTAR_TEST_CASE(leveled_stcs_on_L0) {
     }
     {
         candidates.resize(2);
-        leveled_manifest manifest = leveled_manifest::create(*cf, candidates, sstable_max_size_in_mb);
+        leveled_manifest manifest = leveled_manifest::create(*cf, candidates, sstable_max_size_in_mb, stcs_options);
         auto candidate = manifest.get_compaction_candidates(last_compacted_keys, compaction_counter);
         BOOST_REQUIRE(candidate.level == 0);
         BOOST_REQUIRE(candidate.sstables.empty());
@@ -2231,7 +2252,8 @@ SEASTAR_TEST_CASE(overlapping_starved_sstables_test) {
     compaction_counter[3] = leveled_manifest::NO_COMPACTION_LIMIT+1;
 
     auto candidates = get_candidates_for_leveled_strategy(*cf);
-    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb);
+    sstables::size_tiered_compaction_strategy_options stcs_options;
+    leveled_manifest manifest = leveled_manifest::create(*cf, candidates, max_sstable_size_in_mb, stcs_options);
     auto candidate = manifest.get_compaction_candidates(last_compacted_keys, compaction_counter);
     BOOST_REQUIRE(candidate.level == 2);
     BOOST_REQUIRE(candidate.sstables.size() == 3);
@@ -2279,7 +2301,7 @@ SEASTAR_TEST_CASE(check_read_indexes) {
 
     auto fut = sst->load();
     return fut.then([sst] {
-        return sstables::test(sst).read_indexes(0).then([sst] (index_list list) {
+        return sstables::test(sst).read_indexes().then([sst] (index_list list) {
             BOOST_REQUIRE(list.size() == 130);
             return make_ready_future<>();
         });
@@ -3146,18 +3168,18 @@ SEASTAR_TEST_CASE(time_window_strategy_correctness_test) {
             auto bound = time_window_compaction_strategy::get_window_lower_bound(duration_cast<seconds>(hours(1)), tstamp);
             buckets[bound].push_back(sstables[i]);
         }
+        sstables::size_tiered_compaction_strategy_options stcs_options;
         auto now = api::timestamp_clock::now().time_since_epoch().count();
         auto new_bucket = time_window_compaction_strategy::newest_bucket(buckets, 4, 32, duration_cast<seconds>(hours(1)),
-            time_window_compaction_strategy::get_window_lower_bound(duration_cast<seconds>(hours(1)), now));
+            time_window_compaction_strategy::get_window_lower_bound(duration_cast<seconds>(hours(1)), now), stcs_options);
         // incoming bucket should not be accepted when it has below the min threshold SSTables
         BOOST_REQUIRE(new_bucket.empty());
 
         now = api::timestamp_clock::now().time_since_epoch().count();
         new_bucket = time_window_compaction_strategy::newest_bucket(buckets, 2, 32, duration_cast<seconds>(hours(1)),
-            time_window_compaction_strategy::get_window_lower_bound(duration_cast<seconds>(hours(1)), now));
+            time_window_compaction_strategy::get_window_lower_bound(duration_cast<seconds>(hours(1)), now), stcs_options);
         // incoming bucket should be accepted when it is larger than the min threshold SSTables
-        // FIXME: enable check below once twcs passes min threshold to size tiered.
-        // BOOST_REQUIRE(!new_bucket.empty());
+        BOOST_REQUIRE(!new_bucket.empty());
 
         // And 2 into the second bucket (1 hour back)
         for (api::timestamp_type i = 3; i < 5; i++) {
@@ -3190,7 +3212,7 @@ SEASTAR_TEST_CASE(time_window_strategy_correctness_test) {
 
         now = api::timestamp_clock::now().time_since_epoch().count();
         new_bucket = time_window_compaction_strategy::newest_bucket(buckets, 4, 32, duration_cast<seconds>(hours(1)),
-            time_window_compaction_strategy::get_window_lower_bound(duration_cast<seconds>(hours(1)), now));
+            time_window_compaction_strategy::get_window_lower_bound(duration_cast<seconds>(hours(1)), now), stcs_options);
         // new bucket should be trimmed to max threshold of 32
         BOOST_REQUIRE(new_bucket.size() == size_t(32));
     });
@@ -3550,7 +3572,7 @@ SEASTAR_TEST_CASE(test_partition_skipping) {
 
 // Must be run in a seastar thread
 static
-shared_sstable make_sstable(sstring path, schema_ptr s, ::mutation_reader rd, sstable_writer_config cfg) {
+shared_sstable make_sstable(sstring path, schema_ptr s, mutation_reader rd, sstable_writer_config cfg) {
     auto sst = make_sstable(s, path, 1, sstables::sstable::version_types::ka, big);
     sst->write_components(std::move(rd), 1, s, cfg).get();
     sst->load().get();
@@ -3610,7 +3632,7 @@ SEASTAR_TEST_CASE(test_repeated_tombstone_skipping) {
                 .with_range(query::clustering_range::make_singular(ck2))
                 .with_range(query::clustering_range::make_singular(ck3))
                 .build();
-            ::mutation_reader rd = ms(table.schema(), query::full_partition_range, slice);
+            mutation_reader rd = ms(table.schema(), query::full_partition_range, slice);
             streamed_mutation_opt smo = rd().get0();
             BOOST_REQUIRE(bool(smo));
             assert_that_stream(std::move(*smo)).has_monotonic_positions();
@@ -3664,11 +3686,11 @@ SEASTAR_TEST_CASE(test_skipping_using_index) {
         auto ms = as_mutation_source(sst);
         auto rd = ms(table.schema(),
             query::full_partition_range,
-            query::full_slice,
+            table.schema()->full_slice(),
             default_priority_class(),
             nullptr,
             streamed_mutation::forwarding::yes,
-            ::mutation_reader::forwarding::yes);
+            mutation_reader::forwarding::yes);
 
         // Consume first partition completely so that index is stale
         {
@@ -4054,6 +4076,77 @@ SEASTAR_TEST_CASE(sstable_expired_data_ratio) {
             auto descriptor = cs.get_sstables_for_compaction(*cf, { sst });
             BOOST_REQUIRE(descriptor.sstables.size() == 0);
         }
+    });
+}
+
+SEASTAR_TEST_CASE(sstable_owner_shards) {
+    return seastar::async([] {
+        cell_locker_stats cl_stats;
+
+        auto builder = schema_builder("tests", "test")
+                .with_column("id", utf8_type, column_kind::partition_key)
+                .with_column("value", int32_type);
+        auto s = builder.build();
+
+        auto tmp = make_lw_shared<tmpdir>();
+        auto sst_gen = [s, tmp, gen = make_lw_shared<unsigned>(1)] () mutable {
+            auto sst = make_sstable(s, tmp->path, (*gen)++, la, big);
+            sst->set_unshared();
+            return sst;
+        };
+        auto make_insert = [&] (auto p) {
+            auto key = partition_key::from_exploded(*s, {to_bytes(p.first)});
+            mutation m(key, s);
+            m.set_clustered_cell(clustering_key::make_empty(), bytes("value"), data_value(int32_t(1)), 1);
+            BOOST_REQUIRE(m.decorated_key().token() == p.second);
+            return m;
+        };
+
+        auto make_shared_sstable = [&] (std::unordered_set<unsigned> shards, unsigned ignore_msb, unsigned smp_count) {
+            auto mut = [&] (auto shard) {
+                auto tokens = token_generation_for_shard(1, shard, ignore_msb, smp_count);
+                return make_insert(tokens[0]);
+            };
+            auto muts = boost::copy_range<std::vector<mutation>>(shards
+                | boost::adaptors::transformed([&] (auto shard) { return mut(shard); }));
+            dht::default_partitioner = std::make_unique<dht::murmur3_partitioner>(1, ignore_msb);
+            auto sst = make_sstable_containing(sst_gen, std::move(muts));
+            dht::default_partitioner = std::make_unique<dht::murmur3_partitioner>(smp_count, ignore_msb);
+            sst = reusable_sst(s, tmp->path, sst->generation()).get0();
+            // restore partitioner
+            dht::default_partitioner = std::make_unique<dht::murmur3_partitioner>(smp::count);
+            return sst;
+        };
+
+        auto assert_sstable_owners = [&] (std::unordered_set<unsigned> expected_owners, unsigned ignore_msb, unsigned smp_count) {
+            assert(expected_owners.size() <= smp_count);
+            auto sst = make_shared_sstable(expected_owners, ignore_msb, smp_count);
+            dht::default_partitioner = std::make_unique<dht::murmur3_partitioner>(smp_count, ignore_msb);
+            auto owners = boost::copy_range<std::unordered_set<unsigned>>(sst->get_shards_for_this_sstable());
+            BOOST_REQUIRE(boost::algorithm::all_of(expected_owners, [&] (unsigned expected_owner) {
+                return owners.count(expected_owner);
+            }));
+        };
+
+        assert_sstable_owners({ 0 }, 0, 1);
+        assert_sstable_owners({ 0 }, 0, 1);
+
+        assert_sstable_owners({ 0 }, 0, 4);
+        assert_sstable_owners({ 0, 1 }, 0, 4);
+        assert_sstable_owners({ 0, 2 }, 0, 4);
+        assert_sstable_owners({ 0, 1, 2, 3 }, 0, 4);
+
+        assert_sstable_owners({ 0 }, 12, 4);
+        assert_sstable_owners({ 0, 1 }, 12, 4);
+        assert_sstable_owners({ 0, 2 }, 12, 4);
+        assert_sstable_owners({ 0, 1, 2, 3 }, 12, 4);
+
+        assert_sstable_owners({ 10 }, 0, 63);
+        assert_sstable_owners({ 10 }, 12, 63);
+        assert_sstable_owners({ 10, 15 }, 0, 63);
+        assert_sstable_owners({ 10, 15 }, 12, 63);
+        assert_sstable_owners({ 0, 10, 15, 20, 30, 40, 50 }, 0, 63);
+        assert_sstable_owners({ 0, 10, 15, 20, 30, 40, 50 }, 12, 63);
     });
 }
 

@@ -37,8 +37,28 @@ operator<<(std::ostream& os, const static_row& row) {
     return os << "{static_row: "<< row._cells << "}";
 }
 
+std::ostream&
+operator<<(std::ostream& os, const partition_start& ph) {
+    return os << "{partition_start: pk "<< ph._key << " partition_tombstone " << ph._partition_tombstone << "}";
+}
+
+std::ostream&
+operator<<(std::ostream& os, const partition_end& eop) {
+    return os << "{partition_end}";
+}
+
+std::ostream& operator<<(std::ostream& out, partition_region r) {
+    switch (r) {
+        case partition_region::partition_start: out << "partition_start"; break;
+        case partition_region::static_row: out << "static_row"; break;
+        case partition_region::clustered: out << "clustered"; break;
+        case partition_region::partition_end: out << "partition_end"; break;
+    }
+    return out;
+}
+
 std::ostream& operator<<(std::ostream& out, position_in_partition_view pos) {
-    out << "{position: " << pos._bound_weight << ":";
+    out << "{position: type " << pos._type << ", bound_weight " << pos._bound_weight << ", key ";
     if (pos._ck) {
         out << *pos._ck;
     } else {
@@ -73,6 +93,18 @@ mutation_fragment::mutation_fragment(range_tombstone&& r)
     new (&_data->_range_tombstone) range_tombstone(std::move(r));
 }
 
+mutation_fragment::mutation_fragment(partition_start&& r)
+        : _kind(kind::partition_start), _data(std::make_unique<data>())
+{
+    new (&_data->_partition_start) partition_start(std::move(r));
+}
+
+mutation_fragment::mutation_fragment(partition_end&& r)
+        : _kind(kind::partition_end), _data(std::make_unique<data>())
+{
+    new (&_data->_partition_end) partition_end(std::move(r));
+}
+
 void mutation_fragment::destroy_data() noexcept
 {
     switch (_kind) {
@@ -84,6 +116,12 @@ void mutation_fragment::destroy_data() noexcept
         break;
     case kind::range_tombstone:
         _data->_range_tombstone.~range_tombstone();
+        break;
+    case kind::partition_start:
+        _data->_partition_start.~partition_start();
+        break;
+    case kind::partition_end:
+        _data->_partition_end.~partition_end();
         break;
     }
 }
@@ -126,7 +164,7 @@ void mutation_fragment::apply(const schema& s, mutation_fragment&& mf)
 
 position_in_partition_view mutation_fragment::position() const
 {
-    return visit([] (auto& mf) { return mf.position(); });
+    return visit([] (auto& mf) -> position_in_partition_view { return mf.position(); });
 }
 
 std::ostream& operator<<(std::ostream& os, const streamed_mutation& sm) {
@@ -141,13 +179,15 @@ std::ostream& operator<<(std::ostream& os, mutation_fragment::kind k)
     case mutation_fragment::kind::static_row: return os << "static row";
     case mutation_fragment::kind::clustering_row: return os << "clustering row";
     case mutation_fragment::kind::range_tombstone: return os << "range tombstone";
+    case mutation_fragment::kind::partition_start: return os << "partition start";
+    case mutation_fragment::kind::partition_end: return os << "partition end";
     }
     abort();
 }
 
 std::ostream& operator<<(std::ostream& os, const mutation_fragment& mf) {
     os << "{mutation_fragment: " << mf._kind << " " << mf.position() << " ";
-    mf.visit([&os] (const auto& what) {
+    mf.visit([&os] (const auto& what) -> void {
        os << what;
     });
     os << "}";
@@ -570,60 +610,6 @@ void range_tombstone_stream::apply(const range_tombstone_list& list, const query
 void range_tombstone_stream::reset() {
     _inside_range_tombstone = false;
     _list.clear();
-}
-
-streamed_mutation reverse_streamed_mutation(streamed_mutation sm) {
-    class reversing_steamed_mutation final : public streamed_mutation::impl {
-        streamed_mutation_opt _source;
-        mutation_fragment_opt _static_row;
-        std::stack<mutation_fragment> _mutation_fragments;
-    private:
-        future<> consume_source() {
-            return repeat([&] {
-                return (*_source)().then([&] (mutation_fragment_opt mf) {
-                    if (!mf) {
-                        return stop_iteration::yes;
-                    } else if (mf->is_static_row()) {
-                        _static_row = std::move(mf);
-                    } else {
-                        if (mf->is_range_tombstone()) {
-                            mf->as_mutable_range_tombstone().flip();
-                        }
-                        _mutation_fragments.emplace(std::move(*mf));
-                    }
-                    return stop_iteration::no;
-                });
-            }).then([&] {
-                _source = { };
-            });
-        }
-    public:
-        explicit reversing_steamed_mutation(streamed_mutation sm)
-            : streamed_mutation::impl(sm.schema(), sm.decorated_key(), sm.partition_tombstone())
-            , _source(std::move(sm))
-        { }
-
-        virtual future<> fill_buffer() override {
-            if (_source) {
-                return consume_source().then([this] { return fill_buffer(); });
-            }
-            if (_static_row) {
-                push_mutation_fragment(std::move(*_static_row));
-                _static_row = { };
-            }
-            while (!is_end_of_stream() && !is_buffer_full()) {
-                if (_mutation_fragments.empty()) {
-                    _end_of_stream = true;
-                } else {
-                    push_mutation_fragment(std::move(_mutation_fragments.top()));
-                    _mutation_fragments.pop();
-                }
-            }
-            return make_ready_future<>();
-        }
-    };
-
-    return make_streamed_mutation<reversing_steamed_mutation>(std::move(sm));
 }
 
 streamed_mutation streamed_mutation_returning(schema_ptr s, dht::decorated_key key, std::vector<mutation_fragment> frags, tombstone t) {

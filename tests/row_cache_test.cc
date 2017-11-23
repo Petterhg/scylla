@@ -22,6 +22,8 @@
 
 #include <boost/test/unit_test.hpp>
 #include <seastar/core/sleep.hh>
+#include <seastar/util/backtrace.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 
 #include "tests/test-utils.hh"
 #include "tests/mutation_assertions.hh"
@@ -42,6 +44,8 @@ thread_local disk_error_signal_type commit_error;
 thread_local disk_error_signal_type general_disk_error;
 
 using namespace std::chrono_literals;
+
+static seastar::logger test_log("test");
 
 static schema_ptr make_schema() {
     return schema_builder("ks", "cf")
@@ -1842,7 +1846,7 @@ SEASTAR_TEST_CASE(test_readers_get_all_data_after_eviction) {
             ::apply(cache, underlying, m);
         };
 
-        auto make_sm = [&] (const query::partition_slice& slice = query::full_slice) {
+        auto make_sm = [&] (const query::partition_slice& slice) {
             auto rd = cache.make_reader(s, query::full_partition_range, slice);
             auto smo = rd().get0();
             BOOST_REQUIRE(smo);
@@ -1851,11 +1855,11 @@ SEASTAR_TEST_CASE(test_readers_get_all_data_after_eviction) {
             return assert_that_stream(std::move(sm));
         };
 
-        auto sm1 = make_sm();
+        auto sm1 = make_sm(s->full_slice());
 
         apply(m2);
 
-        auto sm2 = make_sm();
+        auto sm2 = make_sm(s->full_slice());
 
         auto slice_with_key2 = partition_slice_builder(*s)
             .with_range(query::clustering_range::make_singular(table.make_ckey(2)))
@@ -1906,7 +1910,7 @@ SEASTAR_TEST_CASE(test_tombstones_are_not_missed_when_range_is_invalidated) {
 
         row_cache cache(s.schema(), snapshot_source([&] { return underlying(); }), tracker);
 
-        auto make_sm = [&] (const query::partition_slice& slice = query::full_slice) {
+        auto make_sm = [&] (const query::partition_slice& slice) {
             auto rd = cache.make_reader(s.schema(), pr, slice);
             auto smo = rd().get0();
             BOOST_REQUIRE(smo);
@@ -1925,7 +1929,7 @@ SEASTAR_TEST_CASE(test_tombstones_are_not_missed_when_range_is_invalidated) {
 
             auto sma2 = make_sm(slice_after_7);
 
-            auto sma = make_sm();
+            auto sma = make_sm(s.schema()->full_slice());
             sma.produces_row_with_key(s.make_ckey(0));
             sma.produces_range_tombstone(rt1);
 
@@ -1944,7 +1948,7 @@ SEASTAR_TEST_CASE(test_tombstones_are_not_missed_when_range_is_invalidated) {
         {
             populate_range(cache);
 
-            auto sma = make_sm();
+            auto sma = make_sm(s.schema()->full_slice());
             sma.produces_row_with_key(s.make_ckey(0));
             sma.produces_range_tombstone(rt1);
 
@@ -1965,6 +1969,163 @@ SEASTAR_TEST_CASE(test_tombstones_are_not_missed_when_range_is_invalidated) {
     });
 }
 
+SEASTAR_TEST_CASE(test_exception_safety_of_reads) {
+    return seastar::async([] {
+        cache_tracker tracker;
+        random_mutation_generator gen(random_mutation_generator::generate_counters::no);
+        auto s = gen.schema();
+        memtable_snapshot_source underlying(s);
+
+        auto mut = make_fully_continuous(gen());
+        underlying.apply(mut);
+
+        row_cache cache(s, snapshot_source([&] { return underlying(); }), tracker);
+        auto&& injector = memory::local_failure_injector();
+
+        auto run_queries = [&] {
+            auto slice = partition_slice_builder(*s).with_ranges(gen.make_random_ranges(3)).build();
+            auto&& ranges = slice.row_ranges(*s, mut.key());
+            uint64_t i = 0;
+            while (true) {
+                try {
+                    injector.fail_after(i++);
+                    auto rd = cache.make_reader(s, query::full_partition_range, slice);
+                    auto smo = rd().get0();
+                    BOOST_REQUIRE(smo);
+                    auto got = mutation_from_streamed_mutation(*smo).get0();
+                    smo = rd().get0();
+                    BOOST_REQUIRE(!smo);
+                    injector.cancel();
+
+                    assert_that(got).is_equal_to(mut, ranges);
+                    assert_that(cache.make_reader(s, query::full_partition_range, slice))
+                        .produces(mut, ranges);
+
+                    if (!injector.failed()) {
+                        break;
+                    }
+                } catch (const std::bad_alloc&) {
+                    // expected
+                }
+            }
+        };
+
+        auto run_query = [&] {
+            auto slice = partition_slice_builder(*s).with_ranges(gen.make_random_ranges(3)).build();
+            auto&& ranges = slice.row_ranges(*s, mut.key());
+            injector.fail_after(0);
+            assert_that(cache.make_reader(s, query::full_partition_range, slice))
+                .produces(mut, ranges);
+            injector.cancel();
+        };
+
+        run_queries();
+
+        injector.run_with_callback([&] {
+            if (tracker.region().reclaiming_enabled()) {
+                tracker.region().full_compaction();
+            }
+            injector.fail_after(0);
+        }, run_query);
+
+        injector.run_with_callback([&] {
+            if (tracker.region().reclaiming_enabled()) {
+                cache.evict();
+            }
+        }, run_queries);
+    });
+}
+
+SEASTAR_TEST_CASE(test_exception_safety_of_transitioning_from_underlying_read_to_read_from_cache) {
+    return seastar::async([] {
+        simple_schema s;
+        cache_tracker tracker;
+        memtable_snapshot_source underlying(s.schema());
+
+        auto pk = s.make_pkey(0);
+        auto pr = dht::partition_range::make_singular(pk);
+
+        mutation mut(pk, s.schema());
+        s.add_row(mut, s.make_ckey(6), "v");
+        auto rt = s.make_range_tombstone(s.make_ckey_range(3, 4));
+        mut.partition().apply_row_tombstone(*s.schema(), rt);
+        underlying.apply(mut);
+
+        row_cache cache(s.schema(), snapshot_source([&] { return underlying(); }), tracker);
+
+        auto&& injector = memory::local_failure_injector();
+
+        auto slice = partition_slice_builder(*s.schema())
+            .with_range(s.make_ckey_range(0, 1))
+            .with_range(s.make_ckey_range(3, 6))
+            .build();
+
+        uint64_t i = 0;
+        while (true) {
+            try {
+                cache.evict();
+                populate_range(cache, pr, s.make_ckey_range(6, 10));
+
+                injector.fail_after(i++);
+                auto rd = cache.make_reader(s.schema(), pr, slice);
+                auto smo = rd().get0();
+                BOOST_REQUIRE(smo);
+                auto got = mutation_from_streamed_mutation(*smo).get0();
+                smo = rd().get0();
+                BOOST_REQUIRE(!smo);
+                injector.cancel();
+
+                assert_that(got).is_equal_to(mut);
+
+                if (!injector.failed()) {
+                    break;
+                }
+            } catch (const std::bad_alloc&) {
+                // expected
+            }
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(test_exception_safety_of_partition_scan) {
+    return seastar::async([] {
+        simple_schema s;
+        cache_tracker tracker;
+        memtable_snapshot_source underlying(s.schema());
+
+        auto pkeys = s.make_pkeys(7);
+        std::vector<mutation> muts;
+
+        for (auto&& pk : pkeys) {
+            mutation mut(pk, s.schema());
+            s.add_row(mut, s.make_ckey(1), "v");
+            muts.push_back(mut);
+            underlying.apply(mut);
+        }
+
+        row_cache cache(s.schema(), snapshot_source([&] { return underlying(); }), tracker);
+
+        auto&& injector = memory::local_failure_injector();
+
+        uint64_t i = 0;
+        do {
+            try {
+                cache.evict();
+                populate_range(cache, dht::partition_range::make_singular(pkeys[1]));
+                populate_range(cache, dht::partition_range::make({pkeys[3]}, {pkeys[5]}));
+
+                injector.fail_after(i++);
+                assert_that(cache.make_reader(s.schema()))
+                    .produces(muts)
+                    .produces_end_of_stream();
+                injector.cancel();
+            } catch (const std::bad_alloc&) {
+                // expected
+            }
+        } while (injector.failed());
+    });
+}
+
 SEASTAR_TEST_CASE(test_concurrent_population_before_latest_version_iterator) {
     return seastar::async([] {
         simple_schema s;
@@ -1981,7 +2142,7 @@ SEASTAR_TEST_CASE(test_concurrent_population_before_latest_version_iterator) {
 
         row_cache cache(s.schema(), snapshot_source([&] { return underlying(); }), tracker);
 
-        auto make_sm = [&] (const query::partition_slice& slice = query::full_slice) {
+        auto make_sm = [&] (const query::partition_slice& slice) {
             auto rd = cache.make_reader(s.schema(), pr, slice);
             auto smo = rd().get0();
             BOOST_REQUIRE(smo);
@@ -1992,7 +2153,7 @@ SEASTAR_TEST_CASE(test_concurrent_population_before_latest_version_iterator) {
 
         {
             populate_range(cache, pr, s.make_ckey_range(0, 1));
-            auto rd = make_sm(); // to keep current version alive
+            auto rd = make_sm(s.schema()->full_slice()); // to keep current version alive
 
             mutation m2(pk, s.schema());
             s.add_row(m2, s.make_ckey(2), "v");
@@ -2045,6 +2206,492 @@ SEASTAR_TEST_CASE(test_concurrent_population_before_latest_version_iterator) {
             sma1.produces_row_with_key(s.make_ckey(1));
             sma1.produces_row_with_key(s.make_ckey(3));
             sma1.produces_end_of_stream();
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(test_concurrent_populating_partition_range_reads) {
+    return seastar::async([] {
+        simple_schema s;
+        cache_tracker tracker;
+        memtable_snapshot_source underlying(s.schema());
+
+        auto keys = s.make_pkeys(10);
+        std::vector<mutation> muts;
+
+        for (auto&& k : keys) {
+            mutation m(k, s.schema());
+            m.partition().apply(s.new_tombstone());
+            muts.push_back(m);
+            underlying.apply(m);
+        }
+
+        row_cache cache(s.schema(), snapshot_source([&] { return underlying(); }), tracker);
+
+        // Check the case when one reader inserts entries after the other reader's range but before
+        // that readers upper bound at the time the read started.
+
+        auto range1 = dht::partition_range::make({keys[0]}, {keys[3]});
+        auto range2 = dht::partition_range::make({keys[4]}, {keys[8]});
+
+        populate_range(cache, dht::partition_range::make_singular({keys[0]}));
+        populate_range(cache, dht::partition_range::make_singular({keys[1]}));
+        populate_range(cache, dht::partition_range::make_singular({keys[6]}));
+
+        // FIXME: When readers have buffering across partitions, limit buffering to 1
+        auto rd1 = assert_that(cache.make_reader(s.schema(), range1));
+        rd1.produces(muts[0]);
+
+        auto rd2 = assert_that(cache.make_reader(s.schema(), range2));
+        rd2.produces(muts[4]);
+
+        rd1.produces(muts[1]);
+        rd1.produces(muts[2]);
+        rd1.produces(muts[3]);
+        rd1.produces_end_of_stream();
+
+        rd2.produces(muts[5]);
+        rd2.produces(muts[6]);
+        rd2.produces(muts[7]);
+        rd2.produces(muts[8]);
+        rd1.produces_end_of_stream();
+    });
+}
+
+static void populate_range(row_cache& cache, dht::partition_range& pr, const query::clustering_row_ranges& ranges) {
+    for (auto&& r : ranges) {
+        populate_range(cache, pr, r);
+    }
+}
+
+static void check_continuous(row_cache& cache, dht::partition_range& pr, query::clustering_range r = query::full_clustering_range) {
+    auto s0 = cache.get_cache_tracker().get_stats();
+    populate_range(cache, pr, r);
+    auto s1 = cache.get_cache_tracker().get_stats();
+    if (s0.reads_with_misses != s1.reads_with_misses) {
+        std::cerr << cache << "\n";
+        BOOST_FAIL(sprint("Got cache miss while reading range %s", r));
+    }
+}
+
+static void check_continuous(row_cache& cache, dht::partition_range& pr, const query::clustering_row_ranges& ranges) {
+    for (auto&& r : ranges) {
+        check_continuous(cache, pr, r);
+    }
+}
+
+SEASTAR_TEST_CASE(test_random_row_population) {
+    return seastar::async([] {
+        simple_schema s;
+        cache_tracker tracker;
+        memtable_snapshot_source underlying(s.schema());
+
+        auto pk = s.make_pkey(0);
+        auto pr = dht::partition_range::make_singular(pk);
+
+        mutation m1(pk, s.schema());
+        s.add_row(m1, s.make_ckey(0), "v0");
+        s.add_row(m1, s.make_ckey(2), "v2");
+        s.add_row(m1, s.make_ckey(4), "v4");
+        s.add_row(m1, s.make_ckey(6), "v6");
+        s.add_row(m1, s.make_ckey(8), "v8");
+        unsigned max_key = 9;
+        underlying.apply(m1);
+
+        row_cache cache(s.schema(), snapshot_source([&] { return underlying(); }), tracker);
+
+        auto make_sm = [&] (const query::partition_slice* slice = nullptr) {
+            auto rd = cache.make_reader(s.schema(), pr, slice ? *slice : s.schema()->full_slice());
+            auto smo = rd().get0();
+            BOOST_REQUIRE(smo);
+            streamed_mutation& sm = *smo;
+            sm.set_max_buffer_size(1);
+            return std::move(sm);
+        };
+
+        std::vector<query::clustering_range> ranges;
+
+        ranges.push_back(query::clustering_range::make_ending_with({s.make_ckey(5)}));
+        ranges.push_back(query::clustering_range::make_starting_with({s.make_ckey(5)}));
+        for (unsigned i = 0; i <= max_key; ++i) {
+            for (unsigned j = i; j <= max_key; ++j) {
+                ranges.push_back(query::clustering_range::make({s.make_ckey(i)}, {s.make_ckey(j)}));
+            }
+        }
+
+        std::random_device rnd;
+        std::default_random_engine rng(rnd());
+        std::shuffle(ranges.begin(), ranges.end(), rng);
+
+        struct read {
+            std::unique_ptr<query::partition_slice> slice;
+            streamed_mutation sm;
+            mutation result;
+        };
+
+        std::vector<read> readers;
+        for (auto&& r : ranges) {
+            auto slice = std::make_unique<query::partition_slice>(partition_slice_builder(*s.schema()).with_range(r).build());
+            auto sm = make_sm(slice.get());
+            readers.push_back(read{std::move(slice), std::move(sm), mutation(pk, s.schema())});
+        }
+
+        while (!readers.empty()) {
+            auto i = readers.begin();
+            while (i != readers.end()) {
+                auto mfo = i->sm().get0();
+                if (!mfo) {
+                    auto&& ranges = i->slice->row_ranges(*s.schema(), pk.key());
+                    assert_that(i->result).is_equal_to(m1, ranges);
+                    i = readers.erase(i);
+                } else {
+                    i->result.apply(*mfo);
+                    ++i;
+                }
+            }
+        }
+
+        check_continuous(cache, pr, query::clustering_range::make({s.make_ckey(0)}, {s.make_ckey(9)}));
+    });
+}
+
+SEASTAR_TEST_CASE(test_no_misses_when_read_is_repeated) {
+    return seastar::async([] {
+        random_mutation_generator gen(random_mutation_generator::generate_counters::no);
+        memtable_snapshot_source underlying(gen.schema());
+
+        auto m1 = gen();
+        underlying.apply(m1);
+        auto pr = dht::partition_range::make_singular(m1.decorated_key());
+
+        cache_tracker tracker;
+        row_cache cache(gen.schema(), snapshot_source([&] { return underlying(); }), tracker);
+
+        for (auto n_ranges : {1, 2, 4}) {
+            auto ranges = gen.make_random_ranges(n_ranges);
+            BOOST_TEST_MESSAGE(sprint("Reading {}", ranges));
+
+            populate_range(cache, pr, ranges);
+            check_continuous(cache, pr, ranges);
+            auto s1 = tracker.get_stats();
+            populate_range(cache, pr, ranges);
+            auto s2 = tracker.get_stats();
+
+            if (s1.reads_with_misses != s2.reads_with_misses) {
+                BOOST_FAIL(sprint("Got cache miss when repeating read of %s on %s", ranges, m1));
+            }
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(test_continuity_is_populated_when_read_overlaps_with_older_version) {
+    return seastar::async([] {
+        simple_schema s;
+        cache_tracker tracker;
+        memtable_snapshot_source underlying(s.schema());
+
+        auto pk = s.make_pkey(0);
+        auto pr = dht::partition_range::make_singular(pk);
+
+        mutation m1(pk, s.schema());
+        s.add_row(m1, s.make_ckey(2), "v2");
+        s.add_row(m1, s.make_ckey(4), "v4");
+        underlying.apply(m1);
+
+        mutation m2(pk, s.schema());
+        s.add_row(m2, s.make_ckey(6), "v6");
+        s.add_row(m2, s.make_ckey(8), "v8");
+
+        mutation m3(pk, s.schema());
+        s.add_row(m3, s.make_ckey(10), "v");
+        s.add_row(m3, s.make_ckey(12), "v");
+
+        mutation m4(pk, s.schema());
+        s.add_row(m4, s.make_ckey(14), "v");
+
+        row_cache cache(s.schema(), snapshot_source([&] { return underlying(); }), tracker);
+
+        auto apply = [&] (mutation m) {
+            auto mt = make_lw_shared<memtable>(m.schema());
+            mt->apply(m);
+            cache.update([&] { underlying.apply(m); }, *mt).get();
+        };
+
+        auto make_sm = [&] {
+            auto rd = cache.make_reader(s.schema(), pr);
+            auto smo = rd().get0();
+            BOOST_REQUIRE(smo);
+            streamed_mutation& sm = *smo;
+            sm.set_max_buffer_size(1);
+            return std::move(sm);
+        };
+
+        {
+            auto sm1 = make_sm(); // to keep the old version around
+
+            populate_range(cache, pr, query::clustering_range::make({s.make_ckey(2)}, {s.make_ckey(4)}));
+
+            apply(m2);
+
+            populate_range(cache, pr, s.make_ckey_range(3, 5));
+            check_continuous(cache, pr, s.make_ckey_range(2, 5));
+
+            populate_range(cache, pr, s.make_ckey_range(3, 7));
+            check_continuous(cache, pr, s.make_ckey_range(2, 7));
+
+            populate_range(cache, pr, s.make_ckey_range(3, 8));
+            check_continuous(cache, pr, s.make_ckey_range(2, 8));
+
+            populate_range(cache, pr, s.make_ckey_range(3, 9));
+            check_continuous(cache, pr, s.make_ckey_range(2, 9));
+
+            populate_range(cache, pr, s.make_ckey_range(0, 1));
+            check_continuous(cache, pr, s.make_ckey_range(0, 1));
+            check_continuous(cache, pr, s.make_ckey_range(2, 9));
+
+            populate_range(cache, pr, s.make_ckey_range(1, 2));
+            check_continuous(cache, pr, s.make_ckey_range(0, 9));
+
+            populate_range(cache, pr, query::full_clustering_range);
+            check_continuous(cache, pr, query::full_clustering_range);
+
+            assert_that(cache.make_reader(s.schema(), pr))
+                .produces(m1 + m2)
+                .produces_end_of_stream();
+        }
+
+        cache.evict();
+
+        {
+            populate_range(cache, pr, s.make_ckey_range(2, 2));
+            populate_range(cache, pr, s.make_ckey_range(5, 5));
+            populate_range(cache, pr, s.make_ckey_range(8, 8));
+
+            auto sm1 = make_sm(); // to keep the old version around
+
+            apply(m3);
+
+            populate_range(cache, pr, query::full_clustering_range);
+            check_continuous(cache, pr, query::full_clustering_range);
+
+            assert_that(cache.make_reader(s.schema(), pr))
+                .produces(m1 + m2 + m3)
+                .produces_end_of_stream();
+        }
+
+        cache.evict();
+
+        { // singular range case
+            populate_range(cache, pr, query::clustering_range::make_singular(s.make_ckey(4)));
+            populate_range(cache, pr, query::clustering_range::make_singular(s.make_ckey(7)));
+
+            auto sm1 = make_sm(); // to keep the old version around
+
+            apply(m4);
+
+            populate_range(cache, pr, query::full_clustering_range);
+            check_continuous(cache, pr, query::full_clustering_range);
+
+            assert_that(cache.make_reader(s.schema(), pr))
+                .produces_compacted(m1 + m2 + m3 + m4)
+                .produces_end_of_stream();
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(test_continuity_population_with_multicolumn_clustering_key) {
+    return seastar::async([] {
+        auto s = schema_builder("ks", "cf")
+            .with_column("pk", int32_type, column_kind::partition_key)
+            .with_column("ck1", int32_type, column_kind::clustering_key)
+            .with_column("ck2", int32_type, column_kind::clustering_key)
+            .with_column("v", int32_type)
+            .build();
+
+        cache_tracker tracker;
+        memtable_snapshot_source underlying(s);
+
+        auto pk = dht::global_partitioner().decorate_key(*s,
+            partition_key::from_single_value(*s, data_value(3).serialize()));
+        auto pr = dht::partition_range::make_singular(pk);
+
+        auto ck1 = clustering_key::from_deeply_exploded(*s, {data_value(1), data_value(1)});
+        auto ck2 = clustering_key::from_deeply_exploded(*s, {data_value(1), data_value(2)});
+        auto ck3 = clustering_key::from_deeply_exploded(*s, {data_value(2), data_value(1)});
+        auto ck4 = clustering_key::from_deeply_exploded(*s, {data_value(2), data_value(2)});
+        auto ck_3_4 = clustering_key_prefix::from_deeply_exploded(*s, {data_value(2)});
+        auto ck5 = clustering_key::from_deeply_exploded(*s, {data_value(3), data_value(1)});
+        auto ck6 = clustering_key::from_deeply_exploded(*s, {data_value(3), data_value(2)});
+
+        auto new_tombstone = [] {
+            return tombstone(api::new_timestamp(), gc_clock::now());
+        };
+
+        mutation m34(pk, s);
+        m34.partition().clustered_row(*s, ck3).apply(new_tombstone());
+        m34.partition().clustered_row(*s, ck4).apply(new_tombstone());
+
+        mutation m1(pk, s);
+        m1.partition().clustered_row(*s, ck2).apply(new_tombstone());
+        m1.apply(m34);
+        underlying.apply(m1);
+
+        mutation m2(pk, s);
+        m2.partition().clustered_row(*s, ck6).apply(new_tombstone());
+
+        row_cache cache(s, snapshot_source([&] { return underlying(); }), tracker);
+
+        auto apply = [&] (mutation m) {
+            auto mt = make_lw_shared<memtable>(m.schema());
+            mt->apply(m);
+            cache.update([&] { underlying.apply(m); }, *mt).get();
+        };
+
+        auto make_sm = [&] (const query::partition_slice* slice = nullptr) {
+            auto rd = cache.make_reader(s, pr, slice ? *slice : s->full_slice());
+            auto smo = rd().get0();
+            BOOST_REQUIRE(smo);
+            streamed_mutation& sm = *smo;
+            sm.set_max_buffer_size(1);
+            return std::move(sm);
+        };
+
+        {
+            auto range_3_4 = query::clustering_range::make_singular(ck_3_4);
+            populate_range(cache, pr, range_3_4);
+            check_continuous(cache, pr, range_3_4);
+
+            auto slice1 = partition_slice_builder(*s)
+                .with_range(query::clustering_range::make_singular(ck2))
+                .build();
+            auto sm1 = make_sm(&slice1);
+
+            apply(m2);
+
+            populate_range(cache, pr, query::full_clustering_range);
+            check_continuous(cache, pr, query::full_clustering_range);
+
+            assert_that_stream(std::move(sm1))
+                .produces_row_with_key(ck2)
+                .produces_end_of_stream();
+
+            assert_that(cache.make_reader(s, pr))
+                .produces_compacted(m1 + m2)
+                .produces_end_of_stream();
+
+            auto slice34 = partition_slice_builder(*s)
+                .with_range(range_3_4)
+                .build();
+            assert_that(cache.make_reader(s, pr, slice34))
+                .produces_compacted(m34)
+                .produces_end_of_stream();
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(test_continuity_is_populated_for_single_row_reads) {
+    return seastar::async([] {
+        simple_schema s;
+        cache_tracker tracker;
+        memtable_snapshot_source underlying(s.schema());
+
+        auto pk = s.make_pkey(0);
+        auto pr = dht::partition_range::make_singular(pk);
+
+        mutation m1(pk, s.schema());
+        s.add_row(m1, s.make_ckey(2), "v2");
+        s.add_row(m1, s.make_ckey(4), "v4");
+        s.add_row(m1, s.make_ckey(6), "v6");
+        underlying.apply(m1);
+
+        row_cache cache(s.schema(), snapshot_source([&] { return underlying(); }), tracker);
+
+        populate_range(cache, pr, query::clustering_range::make_singular(s.make_ckey(2)));
+        check_continuous(cache, pr, query::clustering_range::make_singular(s.make_ckey(2)));
+
+        populate_range(cache, pr, query::clustering_range::make_singular(s.make_ckey(6)));
+        check_continuous(cache, pr, query::clustering_range::make_singular(s.make_ckey(6)));
+
+        populate_range(cache, pr, query::clustering_range::make_singular(s.make_ckey(3)));
+        check_continuous(cache, pr, query::clustering_range::make_singular(s.make_ckey(3)));
+
+        populate_range(cache, pr, query::clustering_range::make_singular(s.make_ckey(4)));
+        check_continuous(cache, pr, query::clustering_range::make_singular(s.make_ckey(4)));
+
+        populate_range(cache, pr, query::clustering_range::make_singular(s.make_ckey(1)));
+        check_continuous(cache, pr, query::clustering_range::make_singular(s.make_ckey(1)));
+
+        populate_range(cache, pr, query::clustering_range::make_singular(s.make_ckey(5)));
+        check_continuous(cache, pr, query::clustering_range::make_singular(s.make_ckey(5)));
+
+        populate_range(cache, pr, query::clustering_range::make_singular(s.make_ckey(7)));
+        check_continuous(cache, pr, query::clustering_range::make_singular(s.make_ckey(7)));
+
+        assert_that(cache.make_reader(s.schema()))
+            .produces_compacted(m1)
+            .produces_end_of_stream();
+    });
+}
+
+SEASTAR_TEST_CASE(test_concurrent_setting_of_continuity_on_read_upper_bound) {
+    return seastar::async([] {
+        simple_schema s;
+        cache_tracker tracker;
+        memtable_snapshot_source underlying(s.schema());
+
+        auto pk = s.make_pkey(0);
+        auto pr = dht::partition_range::make_singular(pk);
+
+        mutation m1(pk, s.schema());
+        s.add_row(m1, s.make_ckey(0), "v1");
+        s.add_row(m1, s.make_ckey(1), "v1");
+        s.add_row(m1, s.make_ckey(2), "v1");
+        s.add_row(m1, s.make_ckey(3), "v1");
+        underlying.apply(m1);
+
+        mutation m2(pk, s.schema());
+        s.add_row(m2, s.make_ckey(4), "v2");
+
+        row_cache cache(s.schema(), snapshot_source([&] { return underlying(); }), tracker);
+
+        auto make_sm = [&] (const query::partition_slice* slice = nullptr) {
+            auto rd = cache.make_reader(s.schema(), pr, slice ? *slice : s.schema()->full_slice());
+            auto smo = rd().get0();
+            BOOST_REQUIRE(smo);
+            streamed_mutation& sm = *smo;
+            sm.set_max_buffer_size(1);
+            return std::move(sm);
+        };
+
+        {
+            auto sm1 = make_sm(); // to keep the old version around
+
+            populate_range(cache, pr, s.make_ckey_range(0, 0));
+            populate_range(cache, pr, s.make_ckey_range(3, 3));
+
+            apply(cache, underlying, m2);
+
+            auto slice1 = partition_slice_builder(*s.schema())
+                .with_range(s.make_ckey_range(0, 4))
+                .build();
+            auto sm2 = assert_that_stream(make_sm(&slice1));
+
+            sm2.produces_row_with_key(s.make_ckey(0));
+            sm2.produces_row_with_key(s.make_ckey(1));
+
+            populate_range(cache, pr, s.make_ckey_range(2, 4));
+
+            sm2.produces_row_with_key(s.make_ckey(2));
+            sm2.produces_row_with_key(s.make_ckey(3));
+            sm2.produces_row_with_key(s.make_ckey(4));
+            sm2.produces_end_of_stream();
+
+            // FIXME: [1, 2] will not be continuous due to concurrent population.
+            // check_continuous(cache, pr, s.make_ckey_range(0, 4));
+
+            assert_that(cache.make_reader(s.schema(), pr))
+                .produces(m1 + m2)
+                .produces_end_of_stream();
         }
     });
 }

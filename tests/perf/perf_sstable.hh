@@ -142,32 +142,23 @@ public:
 
     future<double> read_all_indexes(int idx) {
         return do_with(test(_sst[0]), [] (auto& sst) {
-            auto start = test_env::now();
-            auto total = make_lw_shared<size_t>(0);
-            auto& summary = sst.get_summary();
-            auto idx = boost::irange(0, int(summary.header.size));
+            const auto start = test_env::now();
 
-            return do_for_each(idx.begin(), idx.end(), [&sst, total] (uint64_t entry) {
-                return sst.read_indexes(entry).then([total] (auto il) {
-                    *total += il.size();
-                });
-            }).then([total, start] {
+            return sst.read_indexes().then([start] (const auto& indexes) {
                 auto end = test_env::now();
                 auto duration = std::chrono::duration<double>(end - start).count();
-                return *total / duration;
+                return indexes.size() / duration;
             });
         });
     }
 
     future<double> read_sequential_partitions(int idx) {
-        return do_with(_sst[0]->read_rows(s), [this] (sstables::mutation_reader& r) {
+        return do_with(_sst[0]->read_rows_flat(s), [this] (flat_mutation_reader& r) {
             auto start = test_env::now();
             auto total = make_lw_shared<size_t>(0);
             auto done = make_lw_shared<bool>(false);
             return do_until([done] { return *done; }, [this, done, total, &r] {
-                return r.read().then([] (auto sm) {
-                    return mutation_from_streamed_mutation(std::move(sm));
-                }).then([this, done, total] (mutation_opt m) {
+                return read_mutation_from_flat_mutation_reader(s, r).then([this, done, total] (mutation_opt m) {
                     if (!m) {
                         *done = true;
                     } else {

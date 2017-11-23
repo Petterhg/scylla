@@ -25,6 +25,7 @@
 #include "core/reactor.hh"
 #include "core/distributed.hh"
 #include "cql3/query_processor.hh"
+#include <seastar/core/gate.hh>
 #include <memory>
 #include <cstdint>
 #include <boost/intrusive/list.hpp>
@@ -61,6 +62,10 @@ class TMemoryBuffer;
 
 }}}
 
+namespace auth {
+class service;
+}
+
 class thrift_server {
     class connection : public boost::intrusive::list_base_hook<> {
         struct fake_transport;
@@ -79,6 +84,7 @@ class thrift_server {
     public:
         connection(thrift_server& server, connected_socket&& fd, socket_address addr);
         ~connection();
+        connection(connection&&);
         future<> process();
         future<> read();
         future<> write();
@@ -96,8 +102,9 @@ private:
     uint64_t _current_connections = 0;
     uint64_t _requests_served = 0;
     boost::intrusive::list<connection> _connections_list;
+    seastar::gate _stop_gate;
 public:
-    thrift_server(distributed<database>& db, distributed<cql3::query_processor>& qp);
+    thrift_server(distributed<database>& db, distributed<cql3::query_processor>& qp, auth::service&);
     ~thrift_server();
     future<> listen(ipv4_addr addr, bool keepalive);
     future<> stop();
@@ -105,6 +112,9 @@ public:
     uint64_t total_connections() const;
     uint64_t current_connections() const;
     uint64_t requests_served() const;
+
+private:
+    void maybe_retry_accept(int which, bool keepalive, std::exception_ptr ex);
 };
 
 #endif /* APPS_SEASTAR_THRIFT_SERVER_HH_ */

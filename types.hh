@@ -319,6 +319,10 @@ using maybe_empty =
 class abstract_type;
 class data_value;
 
+struct simple_date_native_type {
+    uint32_t days;
+};
+
 using data_type = shared_ptr<const abstract_type>;
 
 template <typename T>
@@ -354,6 +358,7 @@ public:
     data_value(float);
     data_value(double);
     data_value(net::ipv4_address);
+    data_value(simple_date_native_type);
     data_value(db_clock::time_point);
     data_value(boost::multiprecision::cpp_int);
     data_value(big_decimal);
@@ -1227,6 +1232,12 @@ shared_ptr<const abstract_type> data_type_for<db_clock::time_point>() {
 
 template <>
 inline
+shared_ptr<const abstract_type> data_type_for<simple_date_native_type>() {
+    return simple_date_type;
+}
+
+template <>
+inline
 shared_ptr<const abstract_type> data_type_for<net::ipv4_address>() {
     return inet_addr_type;
 }
@@ -1247,6 +1258,18 @@ template <>
 inline
 shared_ptr<const abstract_type> data_type_for<double>() {
     return double_type;
+}
+
+template <>
+inline
+shared_ptr<const abstract_type> data_type_for<boost::multiprecision::cpp_int>() {
+    return varint_type;
+}
+
+template <>
+inline
+shared_ptr<const abstract_type> data_type_for<big_decimal>() {
+    return decimal_type;
 }
 
 namespace std {
@@ -1381,7 +1404,7 @@ bytes serialize_value(Type& t, const Value& value) {
 template<typename T>
 T read_simple(bytes_view& v) {
     if (v.size() < sizeof(T)) {
-        throw marshal_exception();
+        throw marshal_exception(sprint("read_simple - not enough bytes (expected %d, got %d)", sizeof(T), v.size()));
     }
     auto p = v.begin();
     v.remove_prefix(sizeof(T));
@@ -1391,7 +1414,7 @@ T read_simple(bytes_view& v) {
 template<typename T>
 T read_simple_exactly(bytes_view v) {
     if (v.size() != sizeof(T)) {
-        throw marshal_exception();
+        throw marshal_exception(sprint("read_simple_exactly - size mismatch (expected %d, got %d)", sizeof(T), v.size()));
     }
     auto p = v.begin();
     return net::ntoh(*reinterpret_cast<const net::packed<T>*>(p));
@@ -1401,7 +1424,7 @@ inline
 bytes_view
 read_simple_bytes(bytes_view& v, size_t n) {
     if (v.size() < n) {
-        throw marshal_exception();
+        throw marshal_exception(sprint("read_simple_bytes - not enough bytes (requested %d, got %d)", n, v.size()));
     }
     bytes_view ret(v.begin(), n);
     v.remove_prefix(n);
@@ -1414,7 +1437,7 @@ std::experimental::optional<T> read_simple_opt(bytes_view& v) {
         return {};
     }
     if (v.size() != sizeof(T)) {
-        throw marshal_exception();
+        throw marshal_exception(sprint("read_simple_opt - size mismatch (expected %d, got %d)", sizeof(T), v.size()));
     }
     auto p = v.begin();
     v.remove_prefix(sizeof(T));
@@ -1424,7 +1447,7 @@ std::experimental::optional<T> read_simple_opt(bytes_view& v) {
 inline sstring read_simple_short_string(bytes_view& v) {
     uint16_t len = read_simple<uint16_t>(v);
     if (v.size() < len) {
-        throw marshal_exception();
+        throw marshal_exception(sprint("read_simple_short_string - not enough bytes (%d)", v.size()));
     }
     sstring ret(sstring::initialized_later(), len);
     std::copy(v.begin(), v.begin() + len, ret.begin());
@@ -1639,3 +1662,11 @@ struct appending_hash<data_type> {
         feed_hash(h, v->name());
     }
 };
+
+/*
+ * Support for CAST(. AS .) functions.
+ */
+
+using castas_fctn = std::function<data_value(data_value)>;
+
+castas_fctn get_castas_fctn(data_type to_type, data_type from_type);

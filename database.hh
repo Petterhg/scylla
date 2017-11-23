@@ -24,6 +24,7 @@
 
 #include "dht/i_partitioner.hh"
 #include "locator/abstract_replication_strategy.hh"
+#include "index/secondary_index_manager.hh"
 #include "core/sstring.hh"
 #include "core/shared_ptr.hh"
 #include "net/byteorder.hh"
@@ -78,6 +79,7 @@
 #include "utils/phased_barrier.hh"
 #include "cpu_controller.hh"
 #include "dirty_memory_manager.hh"
+#include "reader_resource_tracker.hh"
 
 class cell_locker;
 class cell_locker_stats;
@@ -416,6 +418,7 @@ private:
     // Provided by the database that owns this commitlog
     db::commitlog* _commitlog;
     compaction_manager& _compaction_manager;
+    secondary_index::secondary_index_manager _index_manager;
     int _compaction_disabled = 0;
     utils::phased_barrier _flush_barrier;
     seastar::gate _streaming_flush_gate;
@@ -446,14 +449,14 @@ private:
     lowres_clock::time_point _percentile_cache_timestamp;
     std::chrono::milliseconds _percentile_cache_value;
 private:
-    void update_stats_for_new_sstable(uint64_t disk_space_used_by_sstable, std::vector<unsigned>&& shards_for_the_sstable) noexcept;
+    void update_stats_for_new_sstable(uint64_t disk_space_used_by_sstable, const std::vector<unsigned>& shards_for_the_sstable) noexcept;
     // Adds new sstable to the set of sstables
     // Doesn't update the cache. The cache must be synchronized in order for reads to see
     // the writes contained in this sstable.
     // Cache must be synchronized atomically with this, otherwise write atomicity may not be respected.
     // Doesn't trigger compaction.
     // Strong exception guarantees.
-    void add_sstable(sstables::shared_sstable sstable, std::vector<unsigned>&& shards_for_the_sstable);
+    void add_sstable(sstables::shared_sstable sstable, const std::vector<unsigned>& shards_for_the_sstable);
     // returns an empty pointer if sstable doesn't belong to current shard.
     future<sstables::shared_sstable> open_sstable(sstables::foreign_sstable_open_info info, sstring dir,
         int64_t generation, sstables::sstable_version_types v, sstables::sstable_format_types f);
@@ -568,22 +571,24 @@ public:
     // If I/O needs to be issued to read anything in the specified range, the operations
     // will be scheduled under the priority class given by pc.
     mutation_reader make_reader(schema_ptr schema,
-            const dht::partition_range& range = query::full_partition_range,
-            const query::partition_slice& slice = query::full_slice,
+            const dht::partition_range& range,
+            const query::partition_slice& slice,
             const io_priority_class& pc = default_priority_class(),
             tracing::trace_state_ptr trace_state = nullptr,
             streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
             mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes) const;
 
+    mutation_reader make_reader(schema_ptr schema, const dht::partition_range& range = query::full_partition_range) const {
+        auto& full_slice = schema->full_slice();
+        return make_reader(std::move(schema), range, full_slice);
+    }
+
     // The streaming mutation reader differs from the regular mutation reader in that:
     //  - Reflects all writes accepted by replica prior to creation of the
     //    reader and a _bounded_ amount of writes which arrive later.
     //  - Does not populate the cache
-    mutation_reader make_streaming_reader(schema_ptr schema,
-            const dht::partition_range& range = query::full_partition_range) const;
-
     // Requires ranges to be sorted and disjoint.
-    mutation_reader make_streaming_reader(schema_ptr schema,
+    flat_mutation_reader make_streaming_reader(schema_ptr schema,
             const dht::partition_range_vector& ranges) const;
 
     mutation_source as_mutation_source() const;
@@ -769,6 +774,10 @@ public:
     future<> push_view_replica_updates(const schema_ptr& s, const frozen_mutation& fm) const;
     void add_coordinator_read_latency(utils::estimated_histogram::duration latency);
     std::chrono::milliseconds get_coordinator_read_latency_percentile(double percentile);
+
+    secondary_index::secondary_index_manager& get_index_manager() {
+        return _index_manager;
+    }
 private:
     std::vector<view_ptr> affected_views(const schema_ptr& base, const mutation& update) const;
     future<> generate_and_propagate_view_updates(const schema_ptr& base,
@@ -837,6 +846,7 @@ mutation_reader make_range_sstable_reader(schema_ptr s,
         const dht::partition_range& pr,
         const query::partition_slice& slice,
         const io_priority_class& pc,
+        reader_resource_tracker resource_tracker,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr);
@@ -1018,9 +1028,9 @@ public:
     using timeout_clock = lowres_clock;
 private:
     ::cf_stats _cf_stats;
-    static constexpr size_t max_concurrent_reads() { return 100; }
-    static constexpr size_t max_streaming_concurrent_reads() { return 10; } // They're rather heavyweight, so limit more
-    static constexpr size_t max_system_concurrent_reads() { return 10; }
+    static size_t max_memory_concurrent_reads() { return memory::stats().total_memory() * 0.02; }
+    static size_t max_memory_streaming_concurrent_reads() { return memory::stats().total_memory() * 0.02; }
+    static size_t max_memory_system_concurrent_reads() { return memory::stats().total_memory() * 0.02; };
     static constexpr size_t max_concurrent_sstable_loads() { return 3; }
     struct db_stats {
         uint64_t total_writes = 0;
@@ -1029,6 +1039,10 @@ private:
         uint64_t total_reads = 0;
         uint64_t total_reads_failed = 0;
         uint64_t sstable_read_queue_overloaded = 0;
+
+        uint64_t active_reads = 0;
+        uint64_t active_reads_streaming = 0;
+        uint64_t active_reads_system_keyspace = 0;
 
         uint64_t short_data_queries = 0;
         uint64_t short_mutation_queries = 0;
@@ -1046,10 +1060,10 @@ private:
     seastar::thread_scheduling_group _background_writer_scheduling_group;
     flush_cpu_controller _memtable_cpu_controller;
 
-    semaphore _read_concurrency_sem{max_concurrent_reads()};
-    semaphore _streaming_concurrency_sem{max_streaming_concurrent_reads()};
+    semaphore _read_concurrency_sem{max_memory_concurrent_reads()};
+    semaphore _streaming_concurrency_sem{max_memory_streaming_concurrent_reads()};
     restricted_mutation_reader_config _read_concurrency_config;
-    semaphore _system_read_concurrency_sem{max_system_concurrent_reads()};
+    semaphore _system_read_concurrency_sem{max_memory_system_concurrent_reads()};
     restricted_mutation_reader_config _system_read_concurrency_config;
 
     semaphore _sstable_load_concurrency_sem{max_concurrent_sstable_loads()};
@@ -1226,11 +1240,12 @@ public:
     }
     void register_connection_drop_notifier(netw::messaging_service& ms);
 
+    db_stats& get_stats() {
+        return *_stats;
+    }
+
     friend class distributed_loader;
 };
-
-// FIXME: stub
-class secondary_index_manager {};
 
 future<> update_schema_version_and_announce(distributed<service::storage_proxy>& proxy);
 

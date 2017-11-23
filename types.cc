@@ -58,6 +58,32 @@ sstring time_point_to_string(const T& tp)
     return boost::posix_time::to_iso_extended_string(time);
 }
 
+sstring simple_date_to_string(const uint32_t days_count) {
+    date::days days{days_count - (1UL << 31)};
+    date::year_month_day ymd{date::local_days{days}};
+    std::ostringstream str;
+    str << ymd;
+    return str.str();
+}
+
+sstring time_to_string(const int64_t nanoseconds_count) {
+    std::chrono::nanoseconds nanoseconds{nanoseconds_count};
+    auto time = date::make_time(nanoseconds);
+    std::ostringstream str;
+    str << time;
+    return str.str();
+}
+
+sstring boolean_to_string(const bool b) {
+    return b ? "true" : "false";
+}
+
+sstring inet_to_string(const net::ipv4_address& addr) {
+    std::ostringstream out;
+    out << addr;
+    return out.str();
+}
+
 static const char* byte_type_name      = "org.apache.cassandra.db.marshal.ByteType";
 static const char* short_type_name     = "org.apache.cassandra.db.marshal.ShortType";
 static const char* int32_type_name     = "org.apache.cassandra.db.marshal.Int32Type";
@@ -168,7 +194,7 @@ struct integer_type_impl : simple_type_impl<T> {
     }
     T compose_value(const bytes& b) const {
         if (b.size() != sizeof(T)) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Size mismatch for type %s: got %d bytes", this->name(), b.size()));
         }
         return (T)net::ntoh(*reinterpret_cast<const T*>(b.begin()));
     }
@@ -179,7 +205,7 @@ struct integer_type_impl : simple_type_impl<T> {
     }
     virtual void validate(bytes_view v) const override {
         if (v.size() != 0 && v.size() != sizeof(T)) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Validation failed for type %s: got %d bytes", this->name(), v.size()));
         }
     }
     T parse_int(sstring_view s) const {
@@ -292,7 +318,7 @@ struct string_type_impl : public concrete_type<sstring> {
     virtual void validate(bytes_view v) const override {
         if (as_cql3_type() == cql3::cql3_type::ascii) {
             if (std::any_of(v.begin(), v.end(), [] (int8_t b) { return b < 0; })) {
-                throw marshal_exception();
+                throw marshal_exception("Validation failed - non-ASCII character in an ASCII string");
             }
         } else {
             try {
@@ -411,13 +437,13 @@ struct boolean_type_impl : public simple_type_impl<bool> {
             return make_empty();
         }
         if (v.size() != 1) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Cannot deserialize boolean, size mismatch (%d)", v.size()));
         }
         return make_value(*v.begin() != 0);
     }
     virtual void validate(bytes_view v) const override {
         if (v.size() != 0 && v.size() != 1) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Validation failed for boolean, got %d bytes", v.size()));
         }
     }
     virtual bytes from_string(sstring_view s) const override {
@@ -436,9 +462,9 @@ struct boolean_type_impl : public simple_type_impl<bool> {
             return "";
         }
         if (b.size() != 1) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Unable to serialize boolean, got %d bytes", b.size()));
         }
-        return *b.begin() ? "true" : "false";
+        return boolean_to_string(*b.begin());
     }
     virtual ::shared_ptr<cql3::cql3_type> as_cql3_type() const override {
         return cql3::cql3_type::boolean;
@@ -540,7 +566,7 @@ struct timeuuid_type_impl : public concrete_type<utils::UUID> {
         msb = read_simple<uint64_t>(v);
         lsb = read_simple<uint64_t>(v);
         if (!v.empty()) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Failed to deserialize timeuuid, extra bytes left (%d)", v.size()));
         }
         return make_value(utils::UUID(msb, lsb));
     }
@@ -566,13 +592,13 @@ struct timeuuid_type_impl : public concrete_type<utils::UUID> {
     }
     virtual void validate(bytes_view v) const override {
         if (v.size() != 0 && v.size() != 16) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Validation failed for timeuuid - got %d bytes", v.size()));
         }
         auto msb = read_simple<uint64_t>(v);
         auto lsb = read_simple<uint64_t>(v);
         utils::UUID uuid(msb, lsb);
         if (uuid.version() != 1) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Unsupported UUID version (%d)", uuid.version()));
         }
     }
     virtual bytes from_string(sstring_view s) const override {
@@ -581,11 +607,11 @@ struct timeuuid_type_impl : public concrete_type<utils::UUID> {
         }
         static const std::regex re("^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$");
         if (!std::regex_match(s.begin(), s.end(), re)) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Invalid UUID format (%s)", s));
         }
         utils::UUID v(s);
         if (v.version() != 1) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Unsupported UUID version (%d)", v.version()));
         }
         return v.serialize();
     }
@@ -649,7 +675,7 @@ public:
     // FIXME: isCompatibleWith(timestampuuid)
     virtual void validate(bytes_view v) const override {
         if (v.size() != 0 && v.size() != sizeof(uint64_t)) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Validation failed for timestamp - got %d bytes", v.size()));
         }
     }
     static boost::posix_time::ptime get_time(const std::smatch& sm) {
@@ -669,7 +695,7 @@ public:
             static constexpr auto milliseconds_string_length = 3;
             auto length = sm[10].length();
             if (length > milliseconds_string_length) {
-                throw marshal_exception();
+                throw marshal_exception(sprint("Milliseconds length exceeds expected (%d)", length));
             }
             auto value = boost::lexical_cast<int>(sm[10]);
             while (length < milliseconds_string_length) {
@@ -697,7 +723,7 @@ public:
                 return p.time_of_day() * (sign == '-' ? -1 : 1);
             }
         }
-        throw marshal_exception();
+        throw marshal_exception("Cannot get UTC offset for a timestamp");
     }
     static int64_t timestamp_from_string(sstring_view s) {
         try {
@@ -714,10 +740,10 @@ public:
                 return v;
             }
 
-            std::regex date_re("^(\\d{4})-(\\d+)-(\\d+)([ t](\\d+):(\\d+)(:(\\d+)(\\.(\\d+))?)?)?");
+            std::regex date_re("^(\\d{4})-(\\d+)-(\\d+)([ tT](\\d+):(\\d+)(:(\\d+)(\\.(\\d+))?)?)?");
             std::smatch dsm;
             if (!std::regex_search(str, dsm, date_re)) {
-                throw marshal_exception();
+                throw marshal_exception(sprint("Unable to parse timestamp from '%s'", str));
             }
             auto t = get_time(dsm);
 
@@ -735,7 +761,7 @@ public:
                 auto dst_offset = t2 - t;
                 t -= tz_offset + dst_offset;
             } else {
-                throw marshal_exception();
+                throw marshal_exception(sprint("Unable to parse timezone '%s'", tz));
             }
             return (t - boost::posix_time::from_time_t(0)).total_milliseconds();
         } catch (...) {
@@ -860,11 +886,7 @@ struct simple_date_type_impl : public simple_type_impl<uint32_t> {
         if (v.is_null()) {
             return "";
         }
-        date::days days{from_value(v).get() - (1UL << 31)};
-        date::year_month_day ymd{date::local_days{days}};
-        std::ostringstream str;
-        str << ymd;
-        return str.str();
+        return simple_date_to_string(from_value(v).get());
     }
     virtual ::shared_ptr<cql3::cql3_type> as_cql3_type() const override {
         return cql3::cql3_type::date;
@@ -921,7 +943,7 @@ struct time_type_impl : public simple_type_impl<int64_t> {
         }
         int64_t hours = std::stol(s.substr(0, hours_end).to_string());
         if (hours < 0 || hours >= 24) {
-            throw marshal_exception("Hour out of bounds.");
+            throw marshal_exception(sprint("Hour out of bounds (%d).", hours));
         }
         auto minutes_end = s.find(':', hours_end+1);
         if (minutes_end == std::string::npos) {
@@ -929,7 +951,7 @@ struct time_type_impl : public simple_type_impl<int64_t> {
         }
         int64_t minutes = std::stol(s.substr(hours_end + 1, hours_end-minutes_end).to_string());
         if (minutes < 0 || minutes >= 60) {
-            throw marshal_exception("Minute out of bounds.");
+            throw marshal_exception(sprint("Minute out of bounds (%d).", minutes));
         }
         auto seconds_end = s.find('.', minutes_end+1);
         if (seconds_end == std::string::npos) {
@@ -937,14 +959,14 @@ struct time_type_impl : public simple_type_impl<int64_t> {
         }
         int64_t seconds = std::stol(s.substr(minutes_end + 1, minutes_end-seconds_end).to_string());
         if (seconds < 0 || seconds >= 60) {
-            throw marshal_exception("Second out of bounds.");
+            throw marshal_exception(sprint("Second out of bounds (%d).", seconds));
         }
         int64_t nanoseconds = 0;
         if (seconds_end < s.length()) {
             nanoseconds = std::stol(s.substr(seconds_end + 1).to_string());
             nanoseconds *= std::pow(10, 9-(s.length() - (seconds_end + 1)));
             if (nanoseconds < 0 || nanoseconds >= 1000 * 1000 * 1000) {
-                throw marshal_exception("Nanosecond out of bounds.");
+                throw marshal_exception(sprint("Nanosecond out of bounds (%d).", nanoseconds));
             }
         }
         std::chrono::nanoseconds result{};
@@ -959,11 +981,7 @@ struct time_type_impl : public simple_type_impl<int64_t> {
         if (v.is_null()) {
             return "";
         }
-        std::chrono::nanoseconds nanoseconds{from_value(v).get()};
-        auto time = date::make_time(nanoseconds);
-        std::ostringstream str;
-        str << time;
-        return str.str();
+        return time_to_string(from_value(v).get());
     }
     virtual ::shared_ptr<cql3::cql3_type> as_cql3_type() const override {
         return cql3::cql3_type::time;
@@ -991,7 +1009,7 @@ struct uuid_type_impl : concrete_type<utils::UUID> {
         auto msb = read_simple<uint64_t>(v);
         auto lsb = read_simple<uint64_t>(v);
         if (!v.empty()) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Cannot deserialize uuid, %d bytes left", v.size()));
         }
         return make_value(utils::UUID(msb, lsb));
     }
@@ -1026,7 +1044,7 @@ struct uuid_type_impl : concrete_type<utils::UUID> {
     }
     virtual void validate(bytes_view v) const override {
         if (v.size() != 0 && v.size() != 16) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Validation failed for uuid - got %d bytes", v.size()));
         }
     }
     virtual bytes from_string(sstring_view s) const override {
@@ -1035,7 +1053,7 @@ struct uuid_type_impl : concrete_type<utils::UUID> {
         }
         static const std::regex re("^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$");
         if (!std::regex_match(s.begin(), s.end(), re)) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Cannot parse uuid from '%s'", s));
         }
         utils::UUID v(s);
         return v.serialize();
@@ -1085,7 +1103,7 @@ struct inet_addr_type_impl : concrete_type<net::ipv4_address> {
         }
         auto ip = read_simple<int32_t>(v);
         if (!v.empty()) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Cannot deserialize inet_addr, %d bytes left", v.size()));
         }
         return make_value(net::ipv4_address(ip));
     }
@@ -1103,7 +1121,7 @@ struct inet_addr_type_impl : concrete_type<net::ipv4_address> {
     }
     virtual void validate(bytes_view v) const override {
         if (v.size() != 0 && v.size() != sizeof(uint32_t)) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Validation failed for inet_addr - got %d bytes", v.size()));
         }
     }
     virtual bytes from_string(sstring_view s) const override {
@@ -1115,7 +1133,7 @@ struct inet_addr_type_impl : concrete_type<net::ipv4_address> {
         try {
             ipv4 = net::ipv4_address(std::string(s.data(), s.size()));
         } catch (...) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Failed to parse inet_addr from '%s'", s));
         }
         bytes b(bytes::initialized_later(), sizeof(uint32_t));
         auto out = b.begin();
@@ -1127,8 +1145,7 @@ struct inet_addr_type_impl : concrete_type<net::ipv4_address> {
         if (v.is_null()) {
             return  "";
         }
-        boost::asio::ip::address_v4 ipv4(from_value(v).get().ip);
-        return ipv4.to_string();
+        return inet_to_string(from_value(v).get());
     }
     virtual ::shared_ptr<cql3::cql3_type> as_cql3_type() const override {
         return cql3::cql3_type::inet;
@@ -1202,7 +1219,7 @@ struct floating_type_impl : public simple_type_impl<T> {
         } x;
         x.i = read_simple<typename int_of_size<T>::itype>(v);
         if (!v.empty()) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Cannot deserialize floating - %d bytes left", v.size()));
         }
         return this->make_value(x.d);
     }
@@ -1234,7 +1251,7 @@ struct floating_type_impl : public simple_type_impl<T> {
     }
     virtual void validate(bytes_view v) const override {
         if (v.size() != 0 && v.size() != sizeof(T)) {
-            throw marshal_exception();
+            throw marshal_exception(sprint("Expected %d bytes for a floating type, got %d", sizeof(T), v.size()));
         }
     }
     virtual bytes from_string(sstring_view s) const override {
@@ -1685,7 +1702,7 @@ private:
             v.remove_prefix(d.size);
 
             if (v.empty() && (i != 2)) {
-                throw marshal_exception();
+                throw marshal_exception("Cannot deserialize duration");
             }
 
             return static_cast<counter_type>(d.value);
@@ -2577,7 +2594,7 @@ set_type_impl::deserialize(bytes_view in, cql_serialization_format sf) const {
     for (int i = 0; i != nr; ++i) {
         auto e = _elements->deserialize(read_collection_value(in, sf));
         if (e.is_null()) {
-            throw marshal_exception();
+            throw marshal_exception("Cannot deserialize a set");
         }
         s.push_back(std::move(e));
     }
@@ -2769,7 +2786,7 @@ list_type_impl::deserialize(bytes_view in, cql_serialization_format sf) const {
     for (int i = 0; i != nr; ++i) {
         auto e = _elements->deserialize(read_collection_value(in, sf));
         if (e.is_null()) {
-            throw marshal_exception();
+            throw marshal_exception("Cannot deserialize a list");
         }
         s.push_back(std::move(e));
     }
@@ -3322,6 +3339,9 @@ data_value::data_value(double v) : data_value(make_new(double_type, v)) {
 data_value::data_value(net::ipv4_address v) : data_value(make_new(inet_addr_type, v)) {
 }
 
+data_value::data_value(simple_date_native_type v) : data_value(make_new(simple_date_type, v.days)) {
+}
+
 data_value::data_value(db_clock::time_point v) : data_value(make_new(date_type, v)) {
 }
 
@@ -3376,4 +3396,300 @@ std::ostream& operator<<(std::ostream& out, const data_value& v) {
     auto i = b.begin();
     v.serialize(i);
     return out << v.type()->to_string(b);
+}
+
+/*
+ * Support for CAST(. AS .) functions.
+ */
+namespace {
+
+using bytes_opt = std::experimental::optional<bytes>;
+
+template<typename ToType, typename FromType>
+std::function<data_value(data_value)> make_castas_fctn_simple() {
+    return [](data_value from) -> data_value {
+        auto val_from = value_cast<FromType>(from);
+        return static_cast<ToType>(val_from);
+    };
+}
+
+template<typename ToType>
+std::function<data_value(data_value)> make_castas_fctn_from_decimal_to_float() {
+    return [](data_value from) -> data_value {
+        auto val_from = value_cast<big_decimal>(from);
+        boost::multiprecision::cpp_int ten(10);
+        boost::multiprecision::cpp_rational r = val_from.unscaled_value();
+        r /= boost::multiprecision::pow(ten, val_from.scale());
+        return static_cast<ToType>(r);
+    };
+}
+
+template<typename ToType>
+std::function<data_value(data_value)> make_castas_fctn_from_decimal_to_integer() {
+    return [](data_value from) -> data_value {
+        auto val_from = value_cast<big_decimal>(from);
+        boost::multiprecision::cpp_int ten(10);
+        return static_cast<ToType>(val_from.unscaled_value() / boost::multiprecision::pow(ten, val_from.scale()));
+    };
+}
+
+template<typename FromType>
+std::function<data_value(data_value)> make_castas_fctn_from_integer_to_decimal() {
+    return [](data_value from) -> data_value {
+        auto val_from = value_cast<FromType>(from);
+        return big_decimal(0, static_cast<boost::multiprecision::cpp_int>(val_from));
+    };
+}
+
+template<typename FromType>
+std::function<data_value(data_value)> make_castas_fctn_from_float_to_decimal() {
+    return [](data_value from) -> data_value {
+        auto val_from = value_cast<FromType>(from);
+        return big_decimal(boost::lexical_cast<std::string>(val_from));
+    };
+}
+
+template<typename FromType>
+std::function<data_value(data_value)> make_castas_fctn_to_string() {
+    return [](data_value from) -> data_value {
+        return to_sstring(value_cast<FromType>(from));
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_varint_to_string() {
+    return [](data_value from) -> data_value {
+        return to_sstring(value_cast<boost::multiprecision::cpp_int>(from).str());
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_decimal_to_string() {
+    return [](data_value from) -> data_value {
+        return value_cast<big_decimal>(from).to_string();
+    };
+}
+
+db_clock::time_point millis_to_time_point(const int64_t millis) {
+    return db_clock::time_point{std::chrono::milliseconds(millis)};
+}
+
+simple_date_native_type time_point_to_date(const db_clock::time_point& tp) {
+    const auto epoch = boost::posix_time::from_time_t(0);
+    auto timestamp = tp.time_since_epoch().count();
+    auto time = boost::posix_time::from_time_t(0) + boost::posix_time::milliseconds(timestamp);
+    const auto diff = time.date() - epoch.date();
+    return simple_date_native_type{uint32_t(diff.days() + (1UL<<31))};
+}
+
+db_clock::time_point date_to_time_point(const uint32_t date) {
+    const auto epoch = boost::posix_time::from_time_t(0);
+    const auto target_date = epoch + boost::gregorian::days(int64_t(date) - (1UL<<31));
+    boost::posix_time::time_duration duration = target_date - epoch;
+    const auto millis = std::chrono::milliseconds(duration.total_milliseconds());
+    return db_clock::time_point(std::chrono::duration_cast<db_clock::duration>(millis));
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_timestamp_to_date() {
+    return [](data_value from) -> data_value {
+        const auto val_from = value_cast<db_clock::time_point>(from);
+        return time_point_to_date(val_from);
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_date_to_timestamp() {
+    return [](data_value from) -> data_value {
+        const auto val_from = value_cast<uint32_t>(from);
+        return date_to_time_point(val_from);
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_timeuuid_to_timestamp() {
+    return [](data_value from) -> data_value {
+        const auto val_from = value_cast<utils::UUID>(from);
+        return utils::UUID_gen::unix_timestamp(val_from);
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_timeuuid_to_date() {
+    return [](data_value from) -> data_value {
+        const auto val_from = value_cast<utils::UUID>(from);
+        return time_point_to_date(millis_to_time_point(utils::UUID_gen::unix_timestamp(val_from)));
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_timestamp_to_string() {
+    return [](data_value from) -> data_value {
+        const auto val_from = value_cast<db_clock::time_point>(from);
+        return time_point_to_string(val_from);
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_simple_date_to_string() {
+    return [](data_value from) -> data_value {
+        return simple_date_to_string(value_cast<uint32_t>(from));
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_time_to_string() {
+    return [](data_value from) -> data_value {
+        return time_to_string(value_cast<int64_t>(from));
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_uuid_to_string() {
+    return [](data_value from) -> data_value {
+        return value_cast<utils::UUID>(from).to_sstring();
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_boolean_to_string() {
+    return [](data_value from) -> data_value {
+        return boolean_to_string(value_cast<bool>(from));
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_inet_to_string() {
+    return [](data_value from) -> data_value {
+        return inet_to_string(value_cast<net::ipv4_address>(from));
+    };
+}
+
+// FIXME: Add conversions for counters, after they are fully implemented...
+
+// Map <ToType, FromType> -> castas_fctn
+using castas_fctn_key = std::pair<data_type, data_type>;
+struct castas_fctn_hash {
+    std::size_t operator()(const castas_fctn_key& x) const noexcept {
+        return boost::hash_value(x);
+    }
+};
+using castas_fctns_map = std::unordered_map<castas_fctn_key, castas_fctn, castas_fctn_hash>;
+
+// List of supported castas functions...
+thread_local castas_fctns_map castas_fctns {
+    { {byte_type, byte_type}, make_castas_fctn_simple<int8_t, int8_t>() },
+    { {byte_type, short_type}, make_castas_fctn_simple<int8_t, int16_t>() },
+    { {byte_type, int32_type}, make_castas_fctn_simple<int8_t, int32_t>() },
+    { {byte_type, long_type}, make_castas_fctn_simple<int8_t, int64_t>() },
+    { {byte_type, float_type}, make_castas_fctn_simple<int8_t, float>() },
+    { {byte_type, double_type}, make_castas_fctn_simple<int8_t, double>() },
+    { {byte_type, varint_type}, make_castas_fctn_simple<int8_t, boost::multiprecision::cpp_int>() },
+    { {byte_type, decimal_type}, make_castas_fctn_from_decimal_to_float<int8_t>() },
+
+    { {short_type, byte_type}, make_castas_fctn_simple<int16_t, int8_t>() },
+    { {short_type, short_type}, make_castas_fctn_simple<int16_t, int16_t>() },
+    { {short_type, int32_type}, make_castas_fctn_simple<int16_t, int32_t>() },
+    { {short_type, long_type}, make_castas_fctn_simple<int16_t, int64_t>() },
+    { {short_type, float_type}, make_castas_fctn_simple<int16_t, float>() },
+    { {short_type, double_type}, make_castas_fctn_simple<int16_t, double>() },
+    { {short_type, varint_type}, make_castas_fctn_simple<int16_t, boost::multiprecision::cpp_int>() },
+    { {short_type, decimal_type}, make_castas_fctn_from_decimal_to_float<int16_t>() },
+
+    { {int32_type, byte_type}, make_castas_fctn_simple<int32_t, int8_t>() },
+    { {int32_type, short_type}, make_castas_fctn_simple<int32_t, int16_t>() },
+    { {int32_type, int32_type}, make_castas_fctn_simple<int32_t, int32_t>() },
+    { {int32_type, long_type}, make_castas_fctn_simple<int32_t, int64_t>() },
+    { {int32_type, float_type}, make_castas_fctn_simple<int32_t, float>() },
+    { {int32_type, double_type}, make_castas_fctn_simple<int32_t, double>() },
+    { {int32_type, varint_type}, make_castas_fctn_simple<int32_t, boost::multiprecision::cpp_int>() },
+    { {int32_type, decimal_type}, make_castas_fctn_from_decimal_to_float<int32_t>() },
+
+    { {long_type, byte_type}, make_castas_fctn_simple<int64_t, int8_t>() },
+    { {long_type, short_type}, make_castas_fctn_simple<int64_t, int16_t>() },
+    { {long_type, int32_type}, make_castas_fctn_simple<int64_t, int32_t>() },
+    { {long_type, long_type}, make_castas_fctn_simple<int64_t, int64_t>() },
+    { {long_type, float_type}, make_castas_fctn_simple<int64_t, float>() },
+    { {long_type, double_type}, make_castas_fctn_simple<int64_t, double>() },
+    { {long_type, varint_type}, make_castas_fctn_simple<int64_t, boost::multiprecision::cpp_int>() },
+    { {long_type, decimal_type}, make_castas_fctn_from_decimal_to_float<int64_t>() },
+
+    { {float_type, byte_type}, make_castas_fctn_simple<float, int8_t>() },
+    { {float_type, short_type}, make_castas_fctn_simple<float, int16_t>() },
+    { {float_type, int32_type}, make_castas_fctn_simple<float, int32_t>() },
+    { {float_type, long_type}, make_castas_fctn_simple<float, int64_t>() },
+    { {float_type, float_type}, make_castas_fctn_simple<float, float>() },
+    { {float_type, double_type}, make_castas_fctn_simple<float, double>() },
+    { {float_type, varint_type}, make_castas_fctn_simple<float, boost::multiprecision::cpp_int>() },
+    { {float_type, decimal_type}, make_castas_fctn_from_decimal_to_float<float>() },
+
+    { {double_type, byte_type}, make_castas_fctn_simple<double, int8_t>() },
+    { {double_type, short_type}, make_castas_fctn_simple<double, int16_t>() },
+    { {double_type, int32_type}, make_castas_fctn_simple<double, int32_t>() },
+    { {double_type, long_type}, make_castas_fctn_simple<double, int64_t>() },
+    { {double_type, float_type}, make_castas_fctn_simple<double, float>() },
+    { {double_type, double_type}, make_castas_fctn_simple<double, double>() },
+    { {double_type, varint_type}, make_castas_fctn_simple<double, boost::multiprecision::cpp_int>() },
+    { {double_type, decimal_type}, make_castas_fctn_from_decimal_to_float<double>() },
+
+    { {varint_type, byte_type}, make_castas_fctn_simple<boost::multiprecision::cpp_int, int8_t>() },
+    { {varint_type, short_type}, make_castas_fctn_simple<boost::multiprecision::cpp_int, int16_t>() },
+    { {varint_type, int32_type}, make_castas_fctn_simple<boost::multiprecision::cpp_int, int32_t>() },
+    { {varint_type, long_type}, make_castas_fctn_simple<boost::multiprecision::cpp_int, int64_t>() },
+    { {varint_type, float_type}, make_castas_fctn_simple<boost::multiprecision::cpp_int, float>() },
+    { {varint_type, double_type}, make_castas_fctn_simple<boost::multiprecision::cpp_int, double>() },
+    { {varint_type, varint_type}, make_castas_fctn_simple<boost::multiprecision::cpp_int, boost::multiprecision::cpp_int>() },
+    { {varint_type, decimal_type}, make_castas_fctn_from_decimal_to_integer<boost::multiprecision::cpp_int>() },
+
+    { {decimal_type, byte_type}, make_castas_fctn_from_integer_to_decimal<int8_t>() },
+    { {decimal_type, short_type}, make_castas_fctn_from_integer_to_decimal<int16_t>() },
+    { {decimal_type, int32_type}, make_castas_fctn_from_integer_to_decimal<int32_t>() },
+    { {decimal_type, long_type}, make_castas_fctn_from_integer_to_decimal<int64_t>() },
+    { {decimal_type, float_type}, make_castas_fctn_from_float_to_decimal<float>() },
+    { {decimal_type, double_type}, make_castas_fctn_from_float_to_decimal<double>() },
+    { {decimal_type, varint_type}, make_castas_fctn_from_integer_to_decimal<boost::multiprecision::cpp_int>() },
+    { {decimal_type, decimal_type}, make_castas_fctn_simple<big_decimal, big_decimal>() },
+
+    { {ascii_type, byte_type}, make_castas_fctn_to_string<int8_t>() },
+    { {ascii_type, short_type}, make_castas_fctn_to_string<int16_t>() },
+    { {ascii_type, int32_type}, make_castas_fctn_to_string<int32_t>() },
+    { {ascii_type, long_type}, make_castas_fctn_to_string<int64_t>() },
+    { {ascii_type, float_type}, make_castas_fctn_to_string<float>() },
+    { {ascii_type, double_type}, make_castas_fctn_to_string<double>() },
+    { {ascii_type, varint_type}, make_castas_fctn_from_varint_to_string() },
+    { {ascii_type, decimal_type}, make_castas_fctn_from_decimal_to_string() },
+
+    { {utf8_type, byte_type}, make_castas_fctn_to_string<int8_t>() },
+    { {utf8_type, short_type}, make_castas_fctn_to_string<int16_t>() },
+    { {utf8_type, int32_type}, make_castas_fctn_to_string<int32_t>() },
+    { {utf8_type, long_type}, make_castas_fctn_to_string<int64_t>() },
+    { {utf8_type, float_type}, make_castas_fctn_to_string<float>() },
+    { {utf8_type, double_type}, make_castas_fctn_to_string<double>() },
+    { {utf8_type, varint_type}, make_castas_fctn_from_varint_to_string() },
+    { {utf8_type, decimal_type}, make_castas_fctn_from_decimal_to_string() },
+
+    { {simple_date_type, timestamp_type}, make_castas_fctn_from_timestamp_to_date() },
+    { {simple_date_type, timeuuid_type}, make_castas_fctn_from_timeuuid_to_date() },
+
+    { {timestamp_type, simple_date_type}, make_castas_fctn_from_date_to_timestamp() },
+    { {timestamp_type, timeuuid_type}, make_castas_fctn_from_timeuuid_to_timestamp() },
+
+    { {ascii_type, timestamp_type}, make_castas_fctn_from_timestamp_to_string() },
+    { {ascii_type, simple_date_type}, make_castas_fctn_from_simple_date_to_string() },
+    { {ascii_type, time_type}, make_castas_fctn_from_time_to_string() },
+    { {ascii_type, timeuuid_type}, make_castas_fctn_from_uuid_to_string() },
+    { {ascii_type, uuid_type}, make_castas_fctn_from_uuid_to_string() },
+    { {ascii_type, boolean_type}, make_castas_fctn_from_boolean_to_string() },
+    { {ascii_type, inet_addr_type}, make_castas_fctn_from_inet_to_string() },
+    { {ascii_type, ascii_type}, make_castas_fctn_simple<sstring, sstring>() },
+
+    { {utf8_type, timestamp_type}, make_castas_fctn_from_timestamp_to_string() },
+    { {utf8_type, simple_date_type}, make_castas_fctn_from_simple_date_to_string() },
+    { {utf8_type, time_type}, make_castas_fctn_from_time_to_string() },
+    { {utf8_type, timeuuid_type}, make_castas_fctn_from_uuid_to_string() },
+    { {utf8_type, uuid_type}, make_castas_fctn_from_uuid_to_string() },
+    { {utf8_type, boolean_type}, make_castas_fctn_from_boolean_to_string() },
+    { {utf8_type, boolean_type}, make_castas_fctn_from_boolean_to_string() },
+    { {utf8_type, inet_addr_type}, make_castas_fctn_from_inet_to_string() },
+    { {utf8_type, ascii_type}, make_castas_fctn_simple<sstring, sstring>() },
+    { {utf8_type, utf8_type}, make_castas_fctn_simple<sstring, sstring>() },
+};
+
+} /* Anonymous Namespace */
+
+castas_fctn get_castas_fctn(data_type to_type, data_type from_type) {
+    auto it_candidate = castas_fctns.find(castas_fctn_key{to_type, from_type});
+    if (it_candidate == castas_fctns.end()) {
+        throw exceptions::invalid_request_exception(sprint("%s cannot be cast to %s", from_type->name(), to_type->name()));
+    }
+
+    return it_candidate->second;
 }

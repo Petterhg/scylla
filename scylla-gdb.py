@@ -3,6 +3,7 @@ import re
 from operator import attrgetter
 from collections import defaultdict
 import re
+import random
 
 def template_arguments(gdb_type):
     n = 0
@@ -197,6 +198,61 @@ class scylla_column_families(gdb.Command):
                 schema_version = str(schema['_raw']['_version'])
                 gdb.write('{:5} {} v={} {:45} (column_family*){}\n'.format(shard, key, schema_version, name, value.address))
 
+class scylla_task_histogram(gdb.Command):
+    def __init__(self):
+        gdb.Command.__init__(self, 'scylla task_histogram', gdb.COMMAND_USER, gdb.COMPLETE_COMMAND)
+    def invoke(self, arg, from_tty):
+        args = arg.split(' ')
+        def print_usage():
+            gdb.write("Usage: scylla task_histogram [object size]\n")
+
+        if len(args) > 1:
+            print_usage()
+            return
+
+        size = int(args[0]) if args[0] != '' else 0
+        cpu_mem = gdb.parse_and_eval('\'seastar::memory::cpu_mem\'')
+        page_size = int(gdb.parse_and_eval('\'seastar::memory::page_size\''))
+        mem_start = cpu_mem['memory']
+
+        vptr_type = gdb.lookup_type('uintptr_t').pointer()
+
+        pages = cpu_mem['pages']
+        nr_pages = int(cpu_mem['nr_pages'])
+
+        sections = gdb.execute('info files', False, True).split('\n')
+        for line in sections:
+            # vptrs are in .rodata section
+            if line.find("is .rodata") > -1:
+                items = line.split()
+                text_start = int(items[0], 16)
+                text_end = int(items[2], 16)
+                break
+
+        vptr_count = defaultdict(int)
+        scanned_pages = 0;
+        limit = 20000
+        for idx in random.sample(range(0, nr_pages), nr_pages):
+            pool = pages[idx]['pool']
+            if not pool or pages[idx]['offset_in_span'] != 0:
+                continue
+            if int(pool.dereference()['_object_size']) != size and size != 0:
+                continue
+            scanned_pages += 1
+            objsize = size if size != 0 else int(pool.dereference()['_object_size'])
+            span_size = pages[idx]['span_size'] * page_size
+            for idx2 in range(0, int(span_size / objsize)):
+                addr = (mem_start + idx * page_size + idx2 * objsize).reinterpret_cast(vptr_type).dereference()
+                if addr >= text_start and addr <= text_end:
+                    vptr_count[int(addr)] += 1
+            if scanned_pages >= limit or len(vptr_count) >= limit:
+                break
+
+        for vptr, count in sorted(vptr_count.items(), key=lambda e: -e[1])[:30]:
+            sym = resolve(vptr)
+            if sym:
+                gdb.write('%10d: 0x%x %s\n' % (count, vptr, sym))
+
 class scylla_memory(gdb.Command):
     def __init__(self):
         gdb.Command.__init__(self, 'scylla memory', gdb.COMMAND_USER, gdb.COMPLETE_COMMAND)
@@ -216,11 +272,12 @@ class scylla_memory(gdb.Command):
         for i in range(int(nr)):
             sp = small_pools['_u']['a'][i]
             object_size = int(sp['_object_size'])
-            span_size = int(sp['_span_size']) * page_size
+            span_size = int(sp['_span_sizes']['preferred']) * page_size
             free_count = int(sp['_free_count'])
-            spans_in_use = int(sp['_spans_in_use'])
-            memory = spans_in_use * span_size
-            use_count = spans_in_use * int(span_size / object_size) - free_count
+            pages_in_use = int(sp['_pages_in_use'])
+            memory = pages_in_use * page_size
+            # use_count can be off if we used fallback spans rather than preferred spans
+            use_count = int(memory / span_size) * int(span_size / object_size) - free_count
             wasted = free_count * object_size
             wasted_percent = wasted * 100.0 / memory if memory else 0
             gdb.write('{objsize:5} {span_size:6} {use_count:10} {memory:12} {wasted_percent:5.1f}\n'
@@ -1079,3 +1136,4 @@ scylla_threads()
 scylla_task_stats()
 scylla_tasks()
 scylla_find()
+scylla_task_histogram()

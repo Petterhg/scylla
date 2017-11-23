@@ -248,16 +248,13 @@ mutation_partition::mutation_partition(const mutation_partition& x, const schema
             for (const rows_entry& e : x.range(schema, r)) {
                 _rows.insert(_rows.end(), *current_allocator().construct<rows_entry>(e), rows_entry::compare(schema));
             }
+            for (auto&& rt : x._row_tombstones.slice(schema, r)) {
+                _row_tombstones.apply(schema, rt);
+            }
         }
     } catch (...) {
         _rows.clear_and_dispose(current_deleter<rows_entry>());
         throw;
-    }
-
-    for(auto&& r : ck_ranges) {
-        for (auto&& rt : x._row_tombstones.slice(schema, r)) {
-            _row_tombstones.apply(schema, rt);
-        }
     }
 }
 
@@ -332,6 +329,43 @@ mutation_partition::apply(const schema& s, const mutation_partition& p, const sc
 
     mutation_partition tmp(p);
     apply(s, std::move(tmp));
+}
+
+struct mutation_fragment_applier {
+    const schema& _s;
+    mutation_partition& _mp;
+
+    void operator()(tombstone t) {
+        _mp.apply(t);
+    }
+
+    void operator()(range_tombstone rt) {
+        _mp.apply_row_tombstone(_s, std::move(rt));
+    }
+
+    void operator()(static_row sr) {
+        _mp.static_row().apply(_s, column_kind::static_column, std::move(sr.cells()));
+    }
+
+    void operator()(partition_start ps) {
+        _mp.apply(ps.partition_tombstone());
+    }
+
+    void operator()(partition_end ps) {
+    }
+
+    void operator()(clustering_row cr) {
+        auto& dr = _mp.clustered_row(_s, std::move(cr.key()));
+        dr.apply(cr.tomb());
+        dr.apply(cr.marker());
+        dr.cells().apply(_s, column_kind::regular_column, std::move(cr.cells()));
+    }
+};
+
+void
+mutation_partition::apply(const schema& s, const mutation_fragment& mf) {
+    mutation_fragment_applier applier{s, *this};
+    mf.visit(applier);
 }
 
 void
@@ -532,14 +566,18 @@ mutation_partition::clustered_row(const schema& s, position_in_partition_view po
 
 mutation_partition::rows_type::const_iterator
 mutation_partition::lower_bound(const schema& schema, const query::clustering_range& r) const {
-    auto cmp = rows_entry::key_comparator(clustering_key_prefix::prefix_equality_less_compare(schema));
-    return r.lower_bound(_rows, std::move(cmp));
+    if (!r.start()) {
+        return std::cbegin(_rows);
+    }
+    return _rows.lower_bound(position_in_partition_view::for_range_start(r), rows_entry::compare(schema));
 }
 
 mutation_partition::rows_type::const_iterator
 mutation_partition::upper_bound(const schema& schema, const query::clustering_range& r) const {
-    auto cmp = rows_entry::key_comparator(clustering_key_prefix::prefix_equality_less_compare(schema));
-    return r.upper_bound(_rows, std::move(cmp));
+    if (!r.end()) {
+        return std::cend(_rows);
+    }
+    return _rows.lower_bound(position_in_partition_view::for_range_end(r), rows_entry::compare(schema));
 }
 
 boost::iterator_range<mutation_partition::rows_type::const_iterator>
@@ -1177,6 +1215,31 @@ size_t row::external_memory_usage() const {
         }
     }
     return mem;
+}
+
+size_t rows_entry::memory_usage() const {
+    size_t size = 0;
+    if (!dummy()) {
+        size += key().external_memory_usage();
+    }
+    return size +
+           row().cells().external_memory_usage() +
+           sizeof(rows_entry);
+}
+
+size_t mutation_partition::external_memory_usage() const {
+    size_t sum = 0;
+    auto& s = static_row();
+    sum += s.external_memory_usage();
+    for (auto& clr : clustered_rows()) {
+        sum += clr.memory_usage();
+    }
+
+    for (auto& rtb : row_tombstones()) {
+        sum += rtb.memory_usage();
+    }
+
+    return sum;
 }
 
 template<bool reversed, typename Func>
@@ -1934,8 +1997,11 @@ future<> data_query(
     auto cfq = make_stable_flattened_mutations_consumer<compact_for_query<emit_only_live_rows::yes, query_result_builder>>(
             *s, query_time, slice, row_limit, partition_limit, std::move(qrb));
 
-    auto reader = source(s, range, slice, service::get_local_sstable_query_read_priority(), std::move(trace_ptr));
-    return consume_flattened(std::move(reader), std::move(cfq), is_reversed);
+    return do_with(source.make_flat_mutation_reader(s, range, slice, service::get_local_sstable_query_read_priority(), std::move(trace_ptr),
+                                                    streamed_mutation::forwarding::no, mutation_reader::forwarding::no),
+                   [cfq = std::move(cfq), is_reversed] (flat_mutation_reader& reader) mutable {
+        return reader.consume(std::move(cfq), flat_mutation_reader::consume_reversed_partitions(is_reversed));
+    });
 }
 
 class reconcilable_result_builder {
@@ -2038,8 +2104,11 @@ static do_mutation_query(schema_ptr s,
     auto cfq = make_stable_flattened_mutations_consumer<compact_for_query<emit_only_live_rows::no, reconcilable_result_builder>>(
             *s, query_time, slice, row_limit, partition_limit, std::move(rrb));
 
-    auto reader = source(s, range, slice, service::get_local_sstable_query_read_priority(), std::move(trace_ptr));
-    return consume_flattened(std::move(reader), std::move(cfq), is_reversed);
+    return do_with(source.make_flat_mutation_reader(s, range, slice, service::get_local_sstable_query_read_priority(), std::move(trace_ptr),
+                                                    streamed_mutation::forwarding::no, mutation_reader::forwarding::no),
+                   [cfq = std::move(cfq), is_reversed] (flat_mutation_reader& reader) mutable {
+        return reader.consume(std::move(cfq), flat_mutation_reader::consume_reversed_partitions(is_reversed));
+    });
 }
 
 static thread_local auto mutation_query_stage = seastar::make_execution_stage("mutation_query", do_mutation_query);
@@ -2134,7 +2203,8 @@ void mutation_partition::evict() noexcept {
         // No rows would mean it is continuous.
         auto i = _rows.erase_and_dispose(_rows.begin(), std::prev(_rows.end()), current_deleter<rows_entry>());
         rows_entry& e = *i;
-        e._flags._last = true;
+        e._flags._before_ck = false;
+        e._flags._after_ck = true;
         e._flags._dummy = true;
         e._flags._continuous = false;
         e._row = {};
@@ -2184,12 +2254,29 @@ future<mutation_opt> counter_write_query(schema_ptr s, const mutation_source& so
                                          const query::partition_slice& slice,
                                          tracing::trace_state_ptr trace_ptr)
 {
-    return do_with(dht::partition_range::make_singular(dk), [&] (auto& prange) {
-        auto cwqrb = counter_write_query_result_builder(*s);
-        auto cfq = make_stable_flattened_mutations_consumer<compact_for_query<emit_only_live_rows::yes, counter_write_query_result_builder>>(
-                *s, gc_clock::now(), slice, query::max_rows, query::max_rows, std::move(cwqrb));
-        auto reader = source(s, prange, slice,
-                             service::get_local_sstable_query_read_priority(), std::move(trace_ptr));
-        return consume_flattened(std::move(reader), std::move(cfq), false);
-    });
+    struct range_and_reader {
+        dht::partition_range range;
+        flat_mutation_reader reader;
+
+        range_and_reader(range_and_reader&&) = delete;
+        range_and_reader(const range_and_reader&) = delete;
+
+        range_and_reader(schema_ptr s, const mutation_source& source,
+                         const dht::decorated_key& dk,
+                         const query::partition_slice& slice,
+                         tracing::trace_state_ptr trace_ptr)
+            : range(dht::partition_range::make_singular(dk))
+            , reader(source.make_flat_mutation_reader(s, range, slice, service::get_local_sstable_query_read_priority(),
+                                                      std::move(trace_ptr), streamed_mutation::forwarding::no,
+                                                      mutation_reader::forwarding::no))
+        { }
+    };
+
+    // do_with() doesn't support immovable objects
+    auto r_a_r = std::make_unique<range_and_reader>(s, source, dk, slice, std::move(trace_ptr));
+    auto cwqrb = counter_write_query_result_builder(*s);
+    auto cfq = make_stable_flattened_mutations_consumer<compact_for_query<emit_only_live_rows::yes, counter_write_query_result_builder>>(
+            *s, gc_clock::now(), slice, query::max_rows, query::max_rows, std::move(cwqrb));
+    auto f = r_a_r->reader.consume(std::move(cfq), flat_mutation_reader::consume_reversed_partitions::no);
+    return f.finally([r_a_r = std::move(r_a_r)] { });
 }

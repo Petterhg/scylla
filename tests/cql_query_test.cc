@@ -1205,7 +1205,6 @@ SEASTAR_TEST_CASE(test_duration_restrictions) {
                                     env,
                                     "create materialized view my_mv as"
                                     " select * from my_table0 "
-                                    " where name = 'abc' "
                                     " primary key (key, span);",
                                     "Cannot use Duration column 'span' in PRIMARY KEY of materialized view");
                         });
@@ -2305,6 +2304,38 @@ SEASTAR_TEST_CASE(test_reversed_slice_with_empty_range_before_all_rows) {
     });
 }
 
+SEASTAR_TEST_CASE(test_query_with_range_tombstones) {
+    return do_with_cql_env([] (auto& e) {
+        return seastar::async([&e] {
+            e.execute_cql("CREATE TABLE test (pk int, ck int, v int, PRIMARY KEY (pk, ck));").get();
+
+            e.execute_cql("INSERT INTO test (pk, ck, v) VALUES (0, 0, 0);").get();
+            e.execute_cql("INSERT INTO test (pk, ck, v) VALUES (0, 2, 2);").get();
+            e.execute_cql("INSERT INTO test (pk, ck, v) VALUES (0, 4, 4);").get();
+            e.execute_cql("INSERT INTO test (pk, ck, v) VALUES (0, 5, 5);").get();
+            e.execute_cql("INSERT INTO test (pk, ck, v) VALUES (0, 6, 6);").get();
+
+            e.execute_cql("DELETE FROM test WHERE pk = 0 AND ck >= 1 AND ck <= 3;").get();
+            e.execute_cql("DELETE FROM test WHERE pk = 0 AND ck > 4 AND ck <= 8;").get();
+            e.execute_cql("DELETE FROM test WHERE pk = 0 AND ck > 0 AND ck <= 1;").get();
+
+            assert_that(e.execute_cql("SELECT v FROM test WHERE pk = 0 ORDER BY ck DESC;").get0())
+                .is_rows()
+                .with_rows({
+                    { int32_type->decompose(4) },
+                    { int32_type->decompose(0) },
+                });
+
+            assert_that(e.execute_cql("SELECT v FROM test WHERE pk = 0;").get0())
+                .is_rows()
+                .with_rows({
+                   { int32_type->decompose(0) },
+                   { int32_type->decompose(4) },
+                });
+        });
+    });
+}
+
 SEASTAR_TEST_CASE(test_alter_table_validation) {
     return do_with_cql_env([] (auto& e) {
         return e.execute_cql("create table tatv (p1 int, c1 int, c2 int, r1 int, r2 set<int>, PRIMARY KEY (p1, c1, c2));").discard_result().then_wrapped([&e] (auto f) {
@@ -2385,6 +2416,31 @@ SEASTAR_TEST_CASE(test_pg_style_string_literal) {
                 { utf8_type->decompose(sstring("Apostrophe's$ $ not$ $ '' escaped")) },
                 { utf8_type->decompose(sstring("$''valid$_$key")) },
                 { utf8_type->decompose(sstring("$normal$valid$$$$key$")) },
+            });
+        });
+    });
+}
+
+SEASTAR_TEST_CASE(test_secondary_index_query) {
+    return do_with_cql_env([] (auto& e) {
+        return e.execute_cql("CREATE TABLE users (userid int, name text, email text, country text, PRIMARY KEY (userid));").discard_result().then([&e] {
+            return e.execute_cql("CREATE INDEX ON users (email);").discard_result();
+        }).then([&e] {
+            return e.execute_cql("CREATE INDEX ON users (country);").discard_result();
+        }).then([&e] {
+            return e.execute_cql("INSERT INTO users (userid, name, email, country) VALUES (0, 'Bondie Easseby', 'beassebyv@house.gov', 'France');").discard_result();
+        }).then([&e] {
+            return e.execute_cql("INSERT INTO users (userid, name, email, country) VALUES (1, 'Demetri Curror', 'dcurrorw@techcrunch.com', 'France');").discard_result();
+        }).then([&e] {
+            return e.execute_cql("INSERT INTO users (userid, name, email, country) VALUES (2, 'Langston Paulisch', 'lpaulischm@reverbnation.com', 'United States');").discard_result();
+        }).then([&e] {
+            return e.execute_cql("INSERT INTO users (userid, name, email, country) VALUES (3, 'Channa Devote', 'cdevote14@marriott.com', 'Denmark');").discard_result();
+        }).then([&e] {
+            return e.execute_cql("SELECT email FROM users WHERE country = 'France';");
+        }).then([&e] (auto msg) {
+            assert_that(msg).is_rows().with_rows({
+                { utf8_type->decompose(sstring("beassebyv@house.gov")) },
+                { utf8_type->decompose(sstring("dcurrorw@techcrunch.com")) },
             });
         });
     });

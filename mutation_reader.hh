@@ -29,6 +29,7 @@
 #include "core/future-util.hh"
 #include "core/do_with.hh"
 #include "tracing/trace_state.hh"
+#include "flat_mutation_reader.hh"
 
 // A mutation_reader is an object which allows iterating on mutations: invoke
 // the function to get a future for the next mutation, with an unset optional
@@ -61,8 +62,7 @@ public:
     // from streamed_mutation::forwarding - the former is about skipping to
     // a different partition range, while the latter is about skipping
     // inside a large partition.
-    class forwarding_tag;
-    using forwarding = bool_class<forwarding_tag>;
+    using forwarding = flat_mutation_reader::partition_range_forwarding;
 
     class impl {
     public:
@@ -178,28 +178,11 @@ mutation_reader make_combined_reader(mutation_reader&& a, mutation_reader&& b, m
 mutation_reader make_reader_returning(mutation, streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no);
 mutation_reader make_reader_returning(streamed_mutation);
 mutation_reader make_reader_returning_many(std::vector<mutation>,
-    const query::partition_slice& slice = query::full_slice,
+    const query::partition_slice& slice,
     streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no);
-mutation_reader make_reader_returning_many(std::vector<mutation>, const dht::partition_range&);
+mutation_reader make_reader_returning_many(std::vector<mutation>, const dht::partition_range& = query::full_partition_range);
 mutation_reader make_reader_returning_many(std::vector<streamed_mutation>);
 mutation_reader make_empty_reader();
-
-struct restricted_mutation_reader_config {
-    semaphore* sem = nullptr;
-    std::chrono::nanoseconds timeout = {};
-    size_t max_queue_length = std::numeric_limits<size_t>::max();
-    std::function<void ()> raise_queue_overloaded_exception = default_raise_queue_overloaded_exception;
-
-    static void default_raise_queue_overloaded_exception() {
-        throw std::runtime_error("restricted mutation reader queue overload");
-    }
-};
-
-// Restricts a given `mutation_reader` to a concurrency limited according to settings in
-// a restricted_mutation_reader_config.  These settings include a semaphore for limiting the number
-// of active concurrent readers, a timeout for inactive readers, and a maximum queue size for
-// inactive readers.
-mutation_reader make_restricted_reader(const restricted_mutation_reader_config& config, unsigned weight, mutation_reader&& base);
 
 /*
 template<typename T>
@@ -289,6 +272,8 @@ partition_presence_checker make_default_partition_presence_checker() {
     return [] (const dht::decorated_key&) { return partition_presence_checker_result::maybe_exists; };
 }
 
+mutation_reader mutation_reader_from_flat_mutation_reader(flat_mutation_reader&&);
+
 // mutation_source represents source of data in mutation form. The data source
 // can be queried multiple times and in parallel. For each query it returns
 // independent mutation_reader.
@@ -305,18 +290,95 @@ class mutation_source {
         streamed_mutation::forwarding,
         mutation_reader::forwarding
     )>;
+    using flat_reader_factory_type = std::function<flat_mutation_reader(schema_ptr,
+                                                                        partition_range,
+                                                                        const query::partition_slice&,
+                                                                        io_priority,
+                                                                        tracing::trace_state_ptr,
+                                                                        streamed_mutation::forwarding,
+                                                                        mutation_reader::forwarding)>;
+    class impl {
+    public:
+        virtual ~impl() { }
+        virtual mutation_reader make_mutation_reader(schema_ptr s,
+                                                     partition_range range,
+                                                     const query::partition_slice& slice,
+                                                     io_priority pc,
+                                                     tracing::trace_state_ptr trace_state,
+                                                     streamed_mutation::forwarding fwd,
+                                                     mutation_reader::forwarding fwd_mr) = 0;
+        virtual flat_mutation_reader make_flat_mutation_reader(schema_ptr s,
+                                                               partition_range range,
+                                                               const query::partition_slice& slice,
+                                                               io_priority pc,
+                                                               tracing::trace_state_ptr trace_state,
+                                                               streamed_mutation::forwarding fwd,
+                                                               mutation_reader::forwarding fwd_mr) = 0;
+    };
+    class mutation_reader_mutation_source : public impl {
+        func_type _fn;
+    public:
+        mutation_reader_mutation_source(func_type&& fn) : _fn(std::move(fn)) { }
+        virtual mutation_reader make_mutation_reader(schema_ptr s,
+                                                     partition_range range,
+                                                     const query::partition_slice& slice,
+                                                     io_priority pc,
+                                                     tracing::trace_state_ptr trace_state,
+                                                     streamed_mutation::forwarding fwd,
+                                                     mutation_reader::forwarding fwd_mr) override {
+            return _fn(std::move(s), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
+        }
+        virtual flat_mutation_reader make_flat_mutation_reader(schema_ptr s,
+                                                               partition_range range,
+                                                               const query::partition_slice& slice,
+                                                               io_priority pc,
+                                                               tracing::trace_state_ptr trace_state,
+                                                               streamed_mutation::forwarding fwd,
+                                                               mutation_reader::forwarding fwd_mr) override {
+            return flat_mutation_reader_from_mutation_reader(s,
+                                                             _fn(s, range, slice, pc, std::move(trace_state), fwd, fwd_mr),
+                                                             fwd);
+        }
+    };
+    class flat_mutation_reader_mutation_source : public impl {
+        flat_reader_factory_type _fn;
+    public:
+        flat_mutation_reader_mutation_source(flat_reader_factory_type&& fn) : _fn(std::move(fn)) { }
+        virtual mutation_reader make_mutation_reader(schema_ptr s,
+                                                     partition_range range,
+                                                     const query::partition_slice& slice,
+                                                     io_priority pc,
+                                                     tracing::trace_state_ptr trace_state,
+                                                     streamed_mutation::forwarding fwd,
+                                                     mutation_reader::forwarding fwd_mr) override {
+            return mutation_reader_from_flat_mutation_reader(_fn(std::move(s), range, slice, pc, std::move(trace_state), fwd, fwd_mr));
+        }
+        virtual flat_mutation_reader make_flat_mutation_reader(schema_ptr s,
+                                                               partition_range range,
+                                                               const query::partition_slice& slice,
+                                                               io_priority pc,
+                                                               tracing::trace_state_ptr trace_state,
+                                                               streamed_mutation::forwarding fwd,
+                                                               mutation_reader::forwarding fwd_mr) override {
+            return _fn(std::move(s), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
+        }
+    };
     // We could have our own version of std::function<> that is nothrow
     // move constructible and save some indirection and allocation.
     // Probably not worth the effort though.
-    lw_shared_ptr<func_type> _fn;
+    shared_ptr<impl> _impl;
     lw_shared_ptr<std::function<partition_presence_checker()>> _presence_checker_factory;
 private:
     mutation_source() = default;
-    explicit operator bool() const { return bool(_fn); }
+    explicit operator bool() const { return bool(_impl); }
     friend class optimized_optional<mutation_source>;
 public:
     mutation_source(func_type fn, std::function<partition_presence_checker()> pcf = [] { return make_default_partition_presence_checker(); })
-        : _fn(make_lw_shared<func_type>(std::move(fn)))
+        : _impl(seastar::make_shared<mutation_reader_mutation_source>(std::move(fn)))
+        , _presence_checker_factory(make_lw_shared(std::move(pcf)))
+    { }
+    mutation_source(flat_reader_factory_type fn, std::function<partition_presence_checker()> pcf = [] { return make_default_partition_presence_checker(); })
+        : _impl(seastar::make_shared<flat_mutation_reader_mutation_source>(std::move(fn)))
         , _presence_checker_factory(make_lw_shared(std::move(pcf)))
     { }
     // For sources which don't care about the mutation_reader::forwarding flag (always fast forwardable)
@@ -350,14 +412,41 @@ public:
     // All parameters captured by reference must remain live as long as returned
     // mutation_reader or streamed_mutation obtained through it are alive.
     mutation_reader operator()(schema_ptr s,
-        partition_range range = query::full_partition_range,
-        const query::partition_slice& slice = query::full_slice,
+        partition_range range,
+        const query::partition_slice& slice,
         io_priority pc = default_priority_class(),
         tracing::trace_state_ptr trace_state = nullptr,
         streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
         mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes) const
     {
-        return (*_fn)(std::move(s), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
+        return _impl->make_mutation_reader(std::move(s), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
+    }
+
+    mutation_reader operator()(schema_ptr s, partition_range range = query::full_partition_range) const {
+        auto& full_slice = s->full_slice();
+        return (*this)(std::move(s), range, full_slice);
+    }
+
+    flat_mutation_reader
+    make_flat_mutation_reader(
+        schema_ptr s,
+        partition_range range,
+        const query::partition_slice& slice,
+        io_priority pc = default_priority_class(),
+        tracing::trace_state_ptr trace_state = nullptr,
+        streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
+        mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes) const
+    {
+        return _impl->make_flat_mutation_reader(std::move(s), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
+    }
+
+    flat_mutation_reader
+    make_flat_mutation_reader(
+        schema_ptr s,
+        partition_range range = query::full_partition_range) const
+    {
+        auto& full_slice = s->full_slice();
+        return this->make_flat_mutation_reader(std::move(s), range, full_slice);
     }
 
     partition_presence_checker make_partition_presence_checker() {
@@ -391,6 +480,45 @@ public:
 mutation_source make_empty_mutation_source();
 snapshot_source make_empty_snapshot_source();
 
+struct restricted_mutation_reader_config {
+    semaphore* resources_sem = nullptr;
+    uint64_t* active_reads = nullptr;
+    std::chrono::nanoseconds timeout = {};
+    size_t max_queue_length = std::numeric_limits<size_t>::max();
+    std::function<void ()> raise_queue_overloaded_exception = default_raise_queue_overloaded_exception;
+
+    static void default_raise_queue_overloaded_exception() {
+        throw std::runtime_error("restricted mutation reader queue overload");
+    }
+};
+
+// Creates a restricted reader whose resource usages will be tracked
+// during it's lifetime. If there are not enough resources (dues to
+// existing readers) to create the new reader, it's construction will
+// be deferred until there are sufficient resources.
+// The internal reader once created will not be hindered in it's work
+// anymore. Reusorce limits are determined by the config which contains
+// a semaphore to track and limit the memory usage of readers. It also
+// contains a timeout and a maximum queue size for inactive readers
+// whose construction is blocked.
+mutation_reader make_restricted_reader(const restricted_mutation_reader_config& config,
+        mutation_source ms,
+        schema_ptr s,
+        const dht::partition_range& range,
+        const query::partition_slice& slice,
+        const io_priority_class& pc = default_priority_class(),
+        tracing::trace_state_ptr trace_state = nullptr,
+        streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
+        mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes);
+
+inline mutation_reader make_restricted_reader(const restricted_mutation_reader_config& config,
+        mutation_source ms,
+        schema_ptr s,
+        const dht::partition_range& range = query::full_partition_range) {
+    auto& full_slice = s->full_slice();
+    return make_restricted_reader(config, std::move(ms), std::move(s), range, full_slice);
+}
+
 template<>
 struct move_constructor_disengages<mutation_source> {
     enum { value = true };
@@ -411,47 +539,12 @@ future<stop_iteration> do_consume_streamed_mutation_flattened(streamed_mutation&
             }
             f.get();
         } else {
-            if (sm.pop_mutation_fragment().consume(c) == stop_iteration::yes) {
+            if (sm.pop_mutation_fragment().consume_streamed_mutation(c) == stop_iteration::yes) {
                 break;
             }
         }
     } while (true);
     return make_ready_future<stop_iteration>(c.consume_end_of_partition());
-}
-
-/*
-template<typename T>
-concept bool FlattenedConsumer() {
-    return StreamedMutationConsumer() && requires(T obj, const dht::decorated_key& dk) {
-        obj.consume_new_partition(dk);
-        obj.consume_end_of_partition();
-    };
-}
-*/
-template<typename FlattenedConsumer>
-auto consume_flattened(mutation_reader mr, FlattenedConsumer&& c, bool reverse_mutations = false)
-{
-    return do_with(std::move(mr), std::move(c), stdx::optional<streamed_mutation>(), [reverse_mutations] (auto& mr, auto& c, auto& sm) {
-        return repeat([&, reverse_mutations] {
-            return mr().then([&, reverse_mutations] (auto smopt) {
-                if (!smopt) {
-                    return make_ready_future<stop_iteration>(stop_iteration::yes);
-                }
-                if (!reverse_mutations) {
-                    sm.emplace(std::move(*smopt));
-                } else {
-                    sm.emplace(reverse_streamed_mutation(std::move(*smopt)));
-                }
-                c.consume_new_partition(sm->decorated_key());
-                if (sm->partition_tombstone()) {
-                    c.consume(sm->partition_tombstone());
-                }
-                return do_consume_streamed_mutation_flattened(*sm, c);
-            });
-        }).then([&] {
-            return c.consume_end_of_stream();
-        });
-    });
 }
 
 /*
@@ -488,7 +581,7 @@ auto consume_flattened_in_thread(mutation_reader& mr, FlattenedConsumer& c, Stre
                 }
                 sm.fill_buffer().get0();
             } else {
-                if (sm.pop_mutation_fragment().consume(c) == stop_iteration::yes) {
+                if (sm.pop_mutation_fragment().consume_streamed_mutation(c) == stop_iteration::yes) {
                     break;
                 }
             }
@@ -526,9 +619,4 @@ stable_flattened_mutations_consumer<FlattenedConsumer> make_stable_flattened_mut
     return { std::make_unique<FlattenedConsumer>(std::forward<Args>(args)...) };
 }
 
-// Requires ranges to be sorted and disjoint.
-mutation_reader
-make_multi_range_reader(schema_ptr s, mutation_source source, const dht::partition_range_vector& ranges,
-                        const query::partition_slice& slice, const io_priority_class& pc = default_priority_class(),
-                        tracing::trace_state_ptr trace_state = nullptr, streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
-                        mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes);
+future<streamed_mutation_opt> streamed_mutation_from_flat_mutation_reader(flat_mutation_reader&&);

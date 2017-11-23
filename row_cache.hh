@@ -210,6 +210,7 @@ public:
         uint64_t reads;
         uint64_t reads_with_misses;
         uint64_t reads_done;
+        uint64_t pinned_dirty_memory_overload;
 
         uint64_t active_reads() const {
             return reads_done - reads;
@@ -237,6 +238,7 @@ public:
     void on_row_miss();
     void on_miss_already_populated();
     void on_mispopulate();
+    void pinned_dirty_memory_overload(uint64_t bytes);
     allocation_strategy& allocator();
     logalloc::region& region();
     const logalloc::region& region() const;
@@ -438,12 +440,17 @@ public:
     // as long as the reader is used.
     // The range must not wrap around.
     mutation_reader make_reader(schema_ptr,
-                                const dht::partition_range& = query::full_partition_range,
-                                const query::partition_slice& slice = query::full_slice,
+                                const dht::partition_range&,
+                                const query::partition_slice&,
                                 const io_priority_class& = default_priority_class(),
                                 tracing::trace_state_ptr trace_state = nullptr,
                                 streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                 mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no);
+
+    mutation_reader make_reader(schema_ptr s, const dht::partition_range& range = query::full_partition_range) {
+        auto& full_slice = s->full_slice();
+        return make_reader(std::move(s), range, full_slice);
+    }
 
     const stats& stats() const { return _stats; }
 public:

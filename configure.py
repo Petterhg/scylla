@@ -169,6 +169,7 @@ scylla_tests = [
     'tests/mutation_test',
     'tests/mvcc_test',
     'tests/streamed_mutation_test',
+    'tests/flat_mutation_reader_test',
     'tests/schema_registry_test',
     'tests/canonical_mutation_test',
     'tests/range_test',
@@ -202,7 +203,6 @@ scylla_tests = [
     'tests/sstable_test',
     'tests/sstable_mutation_test',
     'tests/sstable_resharding_test',
-    'tests/combined_mutation_reader_test',
     'tests/memtable_test',
     'tests/commitlog_test',
     'tests/cartesian_product_test',
@@ -246,6 +246,10 @@ scylla_tests = [
     'tests/vint_serialization_test',
     'tests/compress_test',
     'tests/chunked_vector_test',
+    'tests/loading_cache_test',
+    'tests/castas_fcts_test',
+    'tests/big_decimal_test',
+    'tests/aggregate_fcts_test',
 ]
 
 apps = [
@@ -300,6 +304,8 @@ add_tristate(arg_parser, name = 'hwloc', dest = 'hwloc', help = 'hwloc support')
 add_tristate(arg_parser, name = 'xen', dest = 'xen', help = 'Xen support')
 arg_parser.add_argument('--enable-gcc6-concepts', dest='gcc6_concepts', action='store_true', default=False,
                         help='enable experimental support for C++ Concepts as implemented in GCC 6')
+arg_parser.add_argument('--enable-alloc-failure-injector', dest='alloc_failure_injector', action='store_true', default=False,
+                        help='enable allocation failure injection')
 args = arg_parser.parse_args()
 
 defines = []
@@ -329,6 +335,7 @@ scylla_core = (['database.cc',
                  'mutation_partition_view.cc',
                  'mutation_partition_serializer.cc',
                  'mutation_reader.cc',
+                 'flat_mutation_reader.cc',
                  'mutation_query.cc',
                  'keys.cc',
                  'counters.cc',
@@ -355,6 +362,7 @@ scylla_core = (['database.cc',
                  'cql3/sets.cc',
                  'cql3/maps.cc',
                  'cql3/functions/functions.cc',
+                 'cql3/functions/castas_fcts.cc',
                  'cql3/statements/cf_prop_defs.cc',
                  'cql3/statements/cf_statement.cc',
                  'cql3/statements/authentication_statement.cc',
@@ -456,6 +464,7 @@ scylla_core = (['database.cc',
                  'utils/dynamic_bitset.cc',
                  'utils/managed_bytes.cc',
                  'utils/exceptions.cc',
+                 'utils/config_file.cc',
                  'gms/version_generator.cc',
                  'gms/versioned_value.cc',
                  'gms/gossiper.cc',
@@ -515,14 +524,18 @@ scylla_core = (['database.cc',
                  'lister.cc',
                  'repair/repair.cc',
                  'exceptions/exceptions.cc',
-                 'auth/auth.cc',
+                 'auth/allow_all_authenticator.cc',
+                 'auth/allow_all_authorizer.cc',
                  'auth/authenticated_user.cc',
                  'auth/authenticator.cc',
-                 'auth/authorizer.cc',
+                 'auth/common.cc',
                  'auth/default_authorizer.cc',
                  'auth/data_resource.cc',
                  'auth/password_authenticator.cc',
                  'auth/permission.cc',
+                 'auth/permissions_cache.cc',
+                 'auth/service.cc',
+                 'auth/transitional.cc',
                  'tracing/tracing.cc',
                  'tracing/trace_keyspace_helper.cc',
                  'tracing/trace_state.cc',
@@ -632,6 +645,7 @@ pure_boost_tests = set([
     'tests/vint_serialization_test',
     'tests/compress_test',
     'tests/chunked_vector_test',
+    'tests/big_decimal_test',
 ])
 
 tests_not_using_seastar_test_framework = set([
@@ -665,7 +679,7 @@ for t in scylla_tests:
         deps[t] += scylla_core + api + idls + ['tests/cql_test_env.cc']
 
 deps['tests/sstable_test'] += ['tests/sstable_datafile_test.cc', 'tests/sstable_utils.cc']
-deps['tests/combined_mutation_reader_test'] += ['tests/sstable_utils.cc']
+deps['tests/mutation_reader_test'] += ['tests/sstable_utils.cc']
 
 deps['tests/bytes_ostream_test'] = ['tests/bytes_ostream_test.cc', 'utils/managed_bytes.cc', 'utils/logalloc.cc', 'utils/dynamic_bitset.cc']
 deps['tests/input_stream_test'] = ['tests/input_stream_test.cc']
@@ -686,6 +700,10 @@ warnings = [
     '-Wno-return-stack-address',
     '-Wno-missing-braces',
     '-Wno-unused-lambda-capture',
+    '-Wno-misleading-indentation',
+    '-Wno-overflow',
+    '-Wno-noexcept-type',
+    '-Wno-nonnull-compare'
     ]
 
 warnings = [w
@@ -783,9 +801,12 @@ if args.staticboost:
     seastar_flags += ['--static-boost']
 if args.gcc6_concepts:
     seastar_flags += ['--enable-gcc6-concepts']
+if args.alloc_failure_injector:
+    seastar_flags += ['--enable-alloc-failure-injector']
 
 seastar_cflags = args.user_cflags + " -march=nehalem"
-seastar_flags += ['--compiler', args.cxx, '--c-compiler', args.cc, '--cflags=%s' % (seastar_cflags)]
+seastar_ldflags = args.user_ldflags
+seastar_flags += ['--compiler', args.cxx, '--c-compiler', args.cc, '--cflags=%s' % (seastar_cflags), '--ldflags=%s' %(seastar_ldflags)]
 
 status = subprocess.call([python, './configure.py'] + seastar_flags, cwd = 'seastar')
 

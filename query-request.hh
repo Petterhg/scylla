@@ -46,6 +46,11 @@ bool is_single_partition(const dht::partition_range& range) {
     return range.is_singular() && range.start()->value().has_key();
 }
 
+inline
+bool is_single_row(const schema& s, const query::clustering_range& range) {
+    return range.is_singular() && range.start()->value().is_full(s);
+}
+
 typedef std::vector<clustering_range> clustering_row_ranges;
 
 class specific_ranges {
@@ -154,10 +159,6 @@ public:
 };
 
 constexpr auto max_partitions = std::numeric_limits<uint32_t>::max();
-
-// This is a partition slice which a full clustering row range and maximum
-// per-partition row limit. No options or columns are set.
-extern const query::partition_slice full_slice;
 
 // Full specification of a query to the database.
 // Intended for passing across replicas.

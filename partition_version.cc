@@ -63,6 +63,11 @@ partition_version::~partition_version()
     }
 }
 
+size_t partition_version::size_in_allocator(allocation_strategy& allocator) const {
+    return allocator.object_memory_size_in_allocator(this) +
+           partition().external_memory_usage();
+}
+
 namespace {
 
 GCC6_CONCEPT(
@@ -480,9 +485,9 @@ void partition_entry::apply_to_incomplete(const schema& s, partition_version* ve
         }
         range_tombstone_list& tombstones = dst.partition().row_tombstones();
         if (can_move) {
-            tombstones.apply_reversibly(s, current->partition().row_tombstones()).cancel();
+            tombstones.apply_monotonically(s, std::move(current->partition().row_tombstones()));
         } else {
-            tombstones.apply(s, current->partition().row_tombstones());
+            tombstones.apply_monotonically(s, current->partition().row_tombstones());
         }
         current = current->next();
     }
@@ -535,7 +540,9 @@ void partition_entry::upgrade(schema_ptr from, schema_ptr to)
 lw_shared_ptr<partition_snapshot> partition_entry::read(logalloc::region& r,
     schema_ptr entry_schema, partition_snapshot::phase_type phase)
 {
-    open_version(*entry_schema, phase);
+    with_allocator(r.allocator(), [&] {
+        open_version(*entry_schema, phase);
+    });
     if (_snapshot) {
         return _snapshot->shared_from_this();
     } else {
@@ -546,7 +553,7 @@ lw_shared_ptr<partition_snapshot> partition_entry::read(logalloc::region& r,
 }
 
 std::vector<range_tombstone>
-partition_snapshot::range_tombstones(const schema& s, position_in_partition_view start, position_in_partition_view end)
+partition_snapshot::range_tombstones(const ::schema& s, position_in_partition_view start, position_in_partition_view end)
 {
     range_tombstone_list list(s);
     for (auto&& v : versions()) {

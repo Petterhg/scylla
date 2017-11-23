@@ -34,6 +34,7 @@
 #include <boost/range/algorithm.hpp>
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include "view_info.hh"
+#include "partition_slice_builder.hh"
 
 constexpr int32_t schema::NAME_LENGTH;
 
@@ -240,6 +241,7 @@ void schema::rebuild() {
     }
 
     _v3_columns = v3_columns::from_v2_schema(*this);
+    _full_slice = make_shared(partition_slice_builder(*this).build());
 }
 
 const column_mapping& schema::get_column_mapping() const {
@@ -976,7 +978,7 @@ void read_collections(schema_builder& builder, sstring comparator)
         do {
             pos = str.find_first_of("()", pos);
             if (pos == sstring::npos) {
-                throw marshal_exception();
+                throw marshal_exception("read_collections - can't find any parentheses");
             }
             if (str[pos] == ')') {
                 nest_level--;
@@ -998,13 +1000,13 @@ void read_collections(schema_builder& builder, sstring comparator)
     while (pos < comparator.size()) {
         size_t end = comparator.find('(', pos);
         if (end == sstring::npos) {
-            throw marshal_exception();
+            throw marshal_exception("read_collections - open parenthesis not found");
         }
         end = find_closing_parenthesis(comparator, end) + 1;
 
         auto colon = comparator.find(':', pos);
         if (colon == sstring::npos || colon > end) {
-            throw marshal_exception();
+            throw marshal_exception("read_collections - colon not found");
         }
 
         auto name = from_hex(sstring_view(comparator.c_str() + pos, colon - pos));
@@ -1020,7 +1022,7 @@ void read_collections(schema_builder& builder, sstring comparator)
         } else if (end < comparator.size() && comparator[end] == ')') {
             pos = sstring::npos;
         } else {
-            throw marshal_exception();
+            throw marshal_exception("read_collections - invalid collection format");
         }
     }
 }

@@ -77,6 +77,7 @@ boost_tests = [
     'idl_test',
     'range_tombstone_list_test',
     'streamed_mutation_test',
+    'flat_mutation_reader_test',
     'anchorless_list_test',
     'database_test',
     'input_stream_test',
@@ -85,13 +86,17 @@ boost_tests = [
     'counter_test',
     'cell_locker_test',
     'view_schema_test',
-    'combined_mutation_reader_test',
     'clustering_ranges_walker_test',
     'vint_serialization_test',
     'duration_test',
+    'loading_cache_test',
+    'castas_fcts_test',
+    'big_decimal_test',
+    'aggregate_fcts_test',
 ]
 
 other_tests = [
+    'memory_footprint',
 ]
 
 last_len = 0
@@ -166,7 +171,7 @@ if __name__ == "__main__":
     if args.name:
         test_to_run = [t for t in test_to_run if args.name in t[0]]
 
-    all_ok = True
+    failed_tests = []
 
     n_total = len(test_to_run)
     env = os.environ
@@ -210,12 +215,15 @@ if __name__ == "__main__":
                 print('=== stdout START ===')
                 print(str(out, encoding='UTF-8'))
                 print('=== stdout END ===')
-            all_ok = False
+            failed_tests.append(path)
         else:
             print_status('%s PASSED %s' % (prefix, path))
 
-    if all_ok:
+    if not failed_tests:
         print('\nOK.')
     else:
-        print_status('')
+        print('\n\nThe following test(s) have failed:')
+        for test in failed_tests:
+            print('  {}'.format(test))
+        print('\nSummary: {} of the total {} tests failed'.format(len(failed_tests), len(test_to_run)))
         sys.exit(1)

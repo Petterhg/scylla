@@ -808,17 +808,17 @@ inter_dc_tcp_nodelay: false
     
 )apa";
 
-namespace db {
+namespace utils {
 template<typename... Args>
-inline std::basic_ostream<Args...> & operator<<(std::basic_ostream<Args...> & os, const db::config::config_source & v) {
-    typedef std::underlying_type<db::config::config_source>::type type;
+inline std::basic_ostream<Args...> & operator<<(std::basic_ostream<Args...> & os, const utils::config_file::config_source & v) {
+    typedef std::underlying_type<utils::config_file::config_source>::type type;
     return os << type(v);
 }
 }
 
 namespace db {
 template<typename... T, typename... Args>
-inline std::basic_ostream<Args...> & operator<<(std::basic_ostream<Args...> & os, const db::config::value<T...> & v) {
+inline std::basic_ostream<Args...> & operator<<(std::basic_ostream<Args...> & os, const db::config::named_value<T...> & v) {
     return os << v();
 }
 }
@@ -826,16 +826,20 @@ inline std::basic_ostream<Args...> & operator<<(std::basic_ostream<Args...> & os
 SEASTAR_TEST_CASE(test_parse_yaml) {
     config cfg;
 
-    cfg.read_from_yaml(cassandra_conf);
+    cfg.read_from_yaml(cassandra_conf, [](auto& opt, auto& msg, auto status) {
+        if (status != config::value_status::Invalid) {
+            throw std::invalid_argument(msg + " : " + opt);
+        }
+    });
 
     BOOST_CHECK_EQUAL(cfg.cluster_name(), "Test Cluster");
     BOOST_CHECK_EQUAL(cfg.cluster_name.is_set(), true);
-    BOOST_CHECK_EQUAL(cfg.cluster_name.source(), config::config_source::SettingsFile);
+    BOOST_CHECK_EQUAL(cfg.cluster_name.source(), utils::config_file::config_source::SettingsFile);
 
 
     BOOST_CHECK_EQUAL(cfg.compaction_throughput_mb_per_sec(), 16);
     BOOST_CHECK_EQUAL(cfg.compaction_throughput_mb_per_sec.is_set(), true);
-    BOOST_CHECK_EQUAL(cfg.compaction_throughput_mb_per_sec.source(), config::config_source::SettingsFile);
+    BOOST_CHECK_EQUAL(cfg.compaction_throughput_mb_per_sec.source(), utils::config_file::config_source::SettingsFile);
 
     /*
      * Horrible, unused, maybe invalid. Let's test it.
@@ -852,13 +856,43 @@ SEASTAR_TEST_CASE(test_parse_yaml) {
               - seeds: "127.0.0.1"
     */
     BOOST_CHECK_EQUAL(cfg.seed_provider.is_set(), true);
-    BOOST_CHECK_EQUAL(cfg.seed_provider.source(), config::config_source::SettingsFile);
+    BOOST_CHECK_EQUAL(cfg.seed_provider.source(), utils::config_file::config_source::SettingsFile);
     BOOST_CHECK_EQUAL(cfg.seed_provider().class_name, "org.apache.cassandra.locator.SimpleSeedProvider");
-    BOOST_CHECK_EQUAL(cfg.seed_provider().parameters,
-            seastar::program_options::string_map({{"seeds", "127.0.0.1"}})
-    );
+
+    const auto expected_seed_provider_params = std::unordered_map<sstring, sstring>({{"seeds", "127.0.0.1"}});
+    BOOST_CHECK_EQUAL(cfg.seed_provider().parameters, expected_seed_provider_params);
 
     return make_ready_future<>();
 }
 
+SEASTAR_TEST_CASE(test_parse_broken) {
+    config cfg;
 
+    bool ok = false;
+
+    // this should become an "unknown option" kind of error.
+    cfg.read_from_yaml(R"foo(bork_bnork:
+    apa
+    ko
+)foo", [&](auto& opt, auto& msg, auto status) {
+        if (!status) { // unknown
+            ok = true;
+        }
+    });
+
+    BOOST_REQUIRE(ok);
+
+    ok = false;
+
+    // this should be a value parsing error.
+    cfg.read_from_yaml(R"foo(commitlog_segment_size_in_mb: flaska
+)foo", [&](auto& opt, auto& msg, auto status) {
+        if (status && status != config::value_status::Invalid) { // option exists and is valid.
+            ok = true;
+        }
+    });
+
+    BOOST_REQUIRE(ok);
+
+    return make_ready_future<>();
+}

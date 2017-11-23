@@ -72,6 +72,7 @@ struct estimated_histogram {
     std::vector<int64_t> buckets;
 
     int64_t _count = 0;
+    int64_t _sample_sum = 0;
 
     estimated_histogram(int bucket_count = 90) {
 
@@ -82,32 +83,25 @@ struct estimated_histogram {
     seastar::metrics::histogram get_histogram(size_t lower_bucket = 1, size_t max_buckets = 16) const {
         seastar::metrics::histogram res;
         res.buckets.resize(max_buckets);
-        double last_bound = lower_bucket;
+        int64_t last_bound = lower_bucket;
+        uint64_t cummulative_count = 0;
         size_t pos = 0;
-        size_t last = buckets.size() - 1;
-        while (last > 0 && buckets[last] == 0) {
-            last--;
-        }
+
         res.sample_count = _count;
+        res.sample_sum = _sample_sum;
         for (size_t i = 0; i < res.buckets.size(); i++) {
             auto& v = res.buckets[i];
             v.upper_bound = last_bound;
 
             while (bucket_offsets[pos] <= last_bound) {
-                if (pos > last) {
-                    res.buckets.resize(i + 1);
-                    return res;
-                }
-                v.count += buckets[pos];
+                cummulative_count += buckets[pos];
                 pos++;
             }
-            last_bound *= 2;
-        }
-        while (pos < buckets.size()) {
-            res.buckets[max_buckets - 1].count += buckets[pos];
-            pos++;
-        }
 
+            v.count = cummulative_count;
+
+            last_bound <<= 1;
+        }
         return res;
     }
 
@@ -160,6 +154,7 @@ public:
     void clear() {
         std::fill(buckets.begin(), buckets.end(), 0);
         _count = 0;
+        _sample_sum = 0;
     }
     /**
      * Increments the count of the bucket closest to n, rounding UP.
@@ -173,6 +168,7 @@ public:
         }
         buckets.at(pos)++;
         _count++;
+        _sample_sum += n;
     }
 
     /**
@@ -193,6 +189,7 @@ public:
             pos = std::distance(bucket_offsets.begin(), low);
         }
         buckets.at(pos)+= new_count - _count;
+        _sample_sum += n * (new_count - _count);
         _count = new_count;
     }
 
@@ -243,6 +240,8 @@ public:
         for (auto p: b.buckets) {
             buckets[i++] += p;
         }
+        _count += b._count;
+        _sample_sum += b._sample_sum;
         return *this;
     }
 

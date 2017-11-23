@@ -260,13 +260,14 @@ private:
     }
 };
 
-cql_server::cql_server(distributed<service::storage_proxy>& proxy, distributed<cql3::query_processor>& qp, cql_load_balance lb)
+cql_server::cql_server(distributed<service::storage_proxy>& proxy, distributed<cql3::query_processor>& qp, cql_load_balance lb, auth::service& auth_service)
     : _proxy(proxy)
     , _query_processor(qp)
     , _max_request_size(memory::stats().total_memory() / 10)
     , _memory_available(_max_request_size)
     , _notifier(std::make_unique<event_notifier>())
     , _lb(lb)
+    , _auth_service(auth_service)
 {
     namespace sm = seastar::metrics;
 
@@ -557,7 +558,7 @@ cql_server::connection::connection(cql_server& server, ipv4_addr server_addr, co
     , _fd(std::move(fd))
     , _read_buf(_fd.input())
     , _write_buf(_fd.output())
-    , _client_state(service::client_state::external_tag{}, addr)
+    , _client_state(service::client_state::external_tag{}, server._auth_service, addr)
 {
     ++_server._total_connections;
     ++_server._current_connections;
@@ -748,9 +749,9 @@ future<response_type> cql_server::connection::process_startup(uint16_t stream, b
              throw exceptions::protocol_exception(sprint("Unknown compression algorithm: %s", compression));
          }
     }
-    auto& a = auth::authenticator::get();
+    auto& a = client_state.get_auth_service()->underlying_authenticator();
     if (a.require_authentication()) {
-        return make_ready_future<response_type>(std::make_pair(make_autheticate(stream, a.class_name(), client_state.get_trace_state()), client_state));
+        return make_ready_future<response_type>(std::make_pair(make_autheticate(stream, a.qualified_java_name(), client_state.get_trace_state()), client_state));
     }
     return make_ready_future<response_type>(std::make_pair(make_ready(stream, client_state.get_trace_state()), client_state));
 }
@@ -758,7 +759,7 @@ future<response_type> cql_server::connection::process_startup(uint16_t stream, b
 future<response_type> cql_server::connection::process_auth_response(uint16_t stream, bytes_view buf, service::client_state client_state)
 {
     if (_sasl_challenge == nullptr) {
-        _sasl_challenge = auth::authenticator::get().new_sasl_challenge();
+        _sasl_challenge = client_state.get_auth_service()->underlying_authenticator().new_sasl_challenge();
     }
 
     auto challenge = _sasl_challenge->evaluate_response(buf);
@@ -831,14 +832,14 @@ future<response_type> cql_server::connection::process_prepare(uint16_t stream, b
     return parallel_for_each(cpus.begin(), cpus.end(), [this, query, cpu_id, &cs] (unsigned int c) mutable {
         if (c != cpu_id) {
             return smp::submit_to(c, [this, query, &cs] () mutable {
-                return _server._query_processor.local().prepare(query, cs, false).discard_result();
+                return _server._query_processor.local().prepare(std::move(query), cs, false).discard_result();
             });
         } else {
             return make_ready_future<>();
         }
-    }).then([this, query, stream, &cs] {
+    }).then([this, query, stream, &cs] () mutable {
         tracing::trace(cs.get_trace_state(), "Done preparing on remote shards");
-        return _server._query_processor.local().prepare(query, cs, false).then([this, stream, &cs] (auto msg) {
+        return _server._query_processor.local().prepare(std::move(query), cs, false).then([this, stream, &cs] (auto msg) {
             tracing::trace(cs.get_trace_state(), "Done preparing on a local shard - preparing a result. ID is [{}]", seastar::value_of([&msg] {
                 return messages::result_message::prepared::cql::get_id(msg);
             }));
@@ -852,8 +853,9 @@ future<response_type> cql_server::connection::process_prepare(uint16_t stream, b
 
 future<response_type> cql_server::connection::process_execute(uint16_t stream, bytes_view buf, service::client_state client_state)
 {
-    auto id = read_short_bytes(buf);
-    auto prepared = _server._query_processor.local().get_prepared(id);
+    cql3::prepared_cache_key_type cache_key(read_short_bytes(buf));
+    auto& id = cql3::prepared_cache_key_type::cql_id(cache_key);
+    auto prepared = _server._query_processor.local().get_prepared(cache_key);
     if (!prepared) {
         throw exceptions::prepared_query_not_found_exception(id);
     }
@@ -929,8 +931,9 @@ cql_server::connection::process_batch(uint16_t stream, bytes_view buf, service::
             break;
         }
         case 1: {
-            auto id = read_short_bytes(buf);
-            ps = _server._query_processor.local().get_prepared(id);
+            cql3::prepared_cache_key_type cache_key(read_short_bytes(buf));
+            auto& id = cql3::prepared_cache_key_type::cql_id(cache_key);
+            ps = _server._query_processor.local().get_prepared(cache_key);
             if (!ps) {
                 throw exceptions::prepared_query_not_found_exception(id);
             }

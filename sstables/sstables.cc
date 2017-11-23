@@ -173,8 +173,7 @@ public:
 shared_sstable
 make_sstable(schema_ptr schema, sstring dir, int64_t generation, sstable_version_types v, sstable_format_types f, gc_clock::time_point now,
             io_error_handler_gen error_handler_gen, size_t buffer_size) {
-    // safe, since shared_from_this() takes ownership
-    return (new sstable(std::move(schema), std::move(dir), generation, v, f, now, std::move(error_handler_gen), buffer_size))->shared_from_this();
+    return make_lw_shared<sstable>(std::move(schema), std::move(dir), generation, v, f, now, std::move(error_handler_gen), buffer_size);
 }
 
 std::unordered_map<sstable::version_types, sstring, enum_hash<sstable::version_types>> sstable::_version_string = {
@@ -1086,14 +1085,6 @@ void write_digest(io_error_handler& error_handler, const sstring file_path, uint
 thread_local std::array<std::vector<int>, downsampling::BASE_SAMPLING_LEVEL> downsampling::_sample_pattern_cache;
 thread_local std::array<std::vector<int>, downsampling::BASE_SAMPLING_LEVEL> downsampling::_original_index_cache;
 
-future<index_list> sstable::read_indexes(uint64_t summary_idx, const io_priority_class& pc) {
-    return do_with(get_index_reader(pc), [summary_idx] (auto& ir_ptr) {
-        return ir_ptr->get_index_entries(summary_idx).finally([&ir_ptr] {
-            return ir_ptr->close();
-        });
-    });
-}
-
 std::unique_ptr<index_reader> sstable::get_index_reader(const io_priority_class& pc) {
     return std::make_unique<index_reader>(shared_from_this(), pc);
 }
@@ -1298,6 +1289,8 @@ future<> sstable::open_data() {
         _index_file = std::get<file>(std::get<0>(files).get());
         _data_file  = std::get<file>(std::get<1>(files).get());
         return this->update_info_for_opened_data();
+    }).then([this] {
+        _shards = compute_shards_for_this_sstable();
     });
 }
 
@@ -1404,6 +1397,7 @@ future<> sstable::load(sstables::foreign_sstable_open_info info) {
         _components = std::move(info.components);
         _data_file = make_checked_file(_read_error_handler, info.data.to_file());
         _index_file = make_checked_file(_read_error_handler, info.index.to_file());
+        _shards = std::move(info.owners);
         validate_min_max_metadata();
         return update_info_for_opened_data();
     });
@@ -1413,9 +1407,8 @@ future<sstable_open_info> sstable::load_shared_components(const schema_ptr& s, s
         const io_priority_class& pc) {
     auto sst = sstables::make_sstable(s, dir, generation, v, f);
     return sst->load(pc).then([sst] () mutable {
-        auto shards = sst->get_shards_for_this_sstable();
         auto info = sstable_open_info{make_lw_shared<shareable_components>(std::move(*sst->_components)),
-            std::move(shards), std::move(sst->_data_file), std::move(sst->_index_file)};
+            std::move(sst->_shards), std::move(sst->_data_file), std::move(sst->_index_file)};
         return make_ready_future<sstable_open_info>(std::move(info));
     });
 }
@@ -2302,7 +2295,7 @@ sstable_writer sstable::get_writer(const schema& s, uint64_t estimated_partition
 }
 
 future<> sstable::write_components(
-        ::mutation_reader mr,
+        mutation_reader mr,
         uint64_t estimated_partitions,
         schema_ptr schema,
         const sstable_writer_config& cfg,
@@ -2553,22 +2546,27 @@ sstable::component_type sstable::component_from_sstring(sstring &s) {
     }
 }
 
-input_stream<char> sstable::data_stream(uint64_t pos, size_t len, const io_priority_class& pc, lw_shared_ptr<file_input_stream_history> history) {
+input_stream<char> sstable::data_stream(uint64_t pos, size_t len, const io_priority_class& pc, reader_resource_tracker resource_tracker, lw_shared_ptr<file_input_stream_history> history) {
     file_input_stream_options options;
     options.buffer_size = sstable_buffer_size;
     options.io_priority_class = pc;
     options.read_ahead = 4;
     options.dynamic_adjustments = std::move(history);
+
+    auto f = resource_tracker.track(_data_file);
+
+    input_stream<char> stream;
     if (_components->compression) {
-        return make_compressed_file_input_stream(_data_file, &_components->compression,
+        return make_compressed_file_input_stream(f, &_components->compression,
                 pos, len, std::move(options));
-    } else {
-        return make_file_input_stream(_data_file, pos, len, std::move(options));
+
     }
+
+    return make_file_input_stream(f, pos, len, std::move(options));
 }
 
 future<temporary_buffer<char>> sstable::data_read(uint64_t pos, size_t len, const io_priority_class& pc) {
-    return do_with(data_stream(pos, len, pc, { }), [len] (auto& stream) {
+    return do_with(data_stream(pos, len, pc, no_resource_tracking(), {}), [len] (auto& stream) {
         return stream.read_exactly(len).finally([&stream] {
             return stream.close();
         });
@@ -2844,17 +2842,6 @@ sstable::get_sstable_key_range(const schema& s) {
     });
 }
 
-future<std::vector<shard_id>>
-sstable::get_owning_shards_from_unloaded() {
-    return when_all(read_summary(default_priority_class()), read_scylla_metadata(default_priority_class())).then(
-            [this] (std::tuple<future<>, future<>> rets) {
-        std::get<0>(rets).get();
-        std::get<1>(rets).get();
-        set_first_and_last_keys();
-        return get_shards_for_this_sstable();
-    });
-}
-
 /**
  * Returns a pair of positions [p1, p2) in the summary file corresponding to entries
  * covered by the specified range, or a disengaged optional if no such pair exists.
@@ -2910,7 +2897,7 @@ uint64_t sstable::estimated_keys_for_range(const dht::token_range& range) {
 }
 
 std::vector<unsigned>
-sstable::get_shards_for_this_sstable() const {
+sstable::compute_shards_for_this_sstable() const {
     std::unordered_set<unsigned> shards;
     dht::partition_range_vector token_ranges;
     const auto* sm = _components->scylla_metadata
@@ -3011,44 +2998,6 @@ future<> init_metrics() {
   });
 }
 
-struct range_reader_adaptor final : public ::mutation_reader::impl {
-    sstables::shared_sstable _sst;
-    sstables::mutation_reader _rd;
-public:
-    range_reader_adaptor(sstables::shared_sstable sst, sstables::mutation_reader rd)
-        : _sst(std::move(sst)), _rd(std::move(rd)) {}
-    virtual future<streamed_mutation_opt> operator()() override {
-        return _rd.read();
-    }
-    virtual future<> fast_forward_to(const dht::partition_range& pr) override {
-        return _rd.fast_forward_to(pr);
-    }
-};
-
-struct single_partition_reader_adaptor final : public ::mutation_reader::impl {
-    sstables::shared_sstable _sst;
-    schema_ptr _s;
-    dht::ring_position_view _key;
-    const query::partition_slice& _slice;
-    const io_priority_class& _pc;
-    streamed_mutation::forwarding _fwd;
-public:
-    single_partition_reader_adaptor(sstables::shared_sstable sst, schema_ptr s, dht::ring_position_view key,
-        const query::partition_slice& slice, const io_priority_class& pc, streamed_mutation::forwarding fwd)
-        : _sst(sst), _s(s), _key(key), _slice(slice), _pc(pc), _fwd(fwd)
-    { }
-    virtual future<streamed_mutation_opt> operator()() override {
-        if (!_sst) {
-            return make_ready_future<streamed_mutation_opt>(stdx::nullopt);
-        }
-        auto sst = std::move(_sst);
-        return sst->read_row(_s, _key, _slice, _pc, _fwd);
-    }
-    virtual future<> fast_forward_to(const dht::partition_range& pr) override {
-        throw std::bad_function_call();
-    }
-};
-
 mutation_source sstable::as_mutation_source() {
     return mutation_source([sst = shared_from_this()] (schema_ptr s,
             const dht::partition_range& range,
@@ -3056,16 +3005,15 @@ mutation_source sstable::as_mutation_source() {
             const io_priority_class& pc,
             tracing::trace_state_ptr trace_ptr,
             streamed_mutation::forwarding fwd,
-            ::mutation_reader::forwarding fwd_mr) mutable {
+            mutation_reader::forwarding fwd_mr) mutable {
         // CAVEAT: if as_mutation_source() is called on a single partition
         // we want to optimize and read exactly this partition. As a
         // consequence, fast_forward_to() will *NOT* work on the result,
         // regardless of what the fwd_mr parameter says.
         if (range.is_singular() && range.start()->value().has_key()) {
-            const dht::ring_position& pos = range.start()->value();
-            return make_mutation_reader<single_partition_reader_adaptor>(sst, s, pos, slice, pc, fwd);
+            return sst->read_row_flat(s, range.start()->value(), slice, pc, no_resource_tracking(), fwd);
         } else {
-            return make_mutation_reader<range_reader_adaptor>(sst, sst->read_range_rows(s, range, slice, pc, fwd, fwd_mr));
+            return sst->read_range_rows_flat(s, range, slice, pc, no_resource_tracking(), fwd, fwd_mr);
         }
     });
 }
