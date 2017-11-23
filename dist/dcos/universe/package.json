@@ -1,0 +1,12 @@
+{
+  "packagingVersion": "4.0",
+  "name": "scylladb",
+  "version": "1.1",
+  "maintainer": "petter.hultin@laketide.com",
+  "description": "Scylla DB",
+  "tags": ["scylladb", "database", "nosql"],
+  "minDcosReleaseVersion": "1.9.0",
+  "preInstallNotes": "This DC/OS package uses ScyllaDB version 2.0!",
+  "postInstallNotes": "ScyllaDB installed!",
+  "postUninstallNotes": "ScyllaDB uninstalled!"
+}
