@@ -28,6 +28,8 @@ class ScyllaSetup:
         self._run(['/usr/lib/scylla/scylla_dev_mode_setup', '--developer-mode', mode])
 
     def io(self):
+        subprocess.Popen(["mkdir", "/var/lib/scylla/data"])        
+        subprocess.Popen(["mkdir", "/var/lib/scylla/commitlog"])        
         self._run(['/usr/lib/scylla/scylla_io_setup'])
 
     def cqlshrc(self):
@@ -45,7 +47,7 @@ class ScyllaSetup:
         
         if self.env_yaml['clientSSL']:
             with open("%s/.cqlshrc" % home, "a") as cqlshrc:
-                cqlshrc.write("[connection]\nhostname = %s\nport = 9042\nfactory = cqlshlib.ssl.ssl_transport_factory\n"                          %hostname)
+                cqlshrc.write("[connection]\nhostname = %s\nport = 9042\nfactory = cqlshlib.ssl.ssl_transport_factory\n" % hostname)
             if not self.env_yaml['downloadKeys']:
                 with open("%s/.cqlshrc" % home, "a") as cqlshrc:
                     cqlshrc.write("[ssl]\ncertfile = /etc/scylla/keys/client/scylladb.crt\n")
@@ -107,7 +109,6 @@ class ScyllaSetup:
          
         # --------- TO YAML ---------
         yamlDict['cluster_name'] = self.env_yaml['clusterName']
-        yamlDict['partitioner'] = self.env_yaml['partitioner'] 
         yamlDict['data_file_directories'] = ['/var/lib/scylla/data']
         yamlDict['commitlog_directory'] = '/var/lib/scylla/commitlog'
         yamlDict['endpoint_snitch'] = self.env_yaml['endpointSnitch']

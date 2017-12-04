@@ -27,8 +27,6 @@ def env_yaml():
     yamlDict['thriftPort'] = int(os.environ.get('SCYLLA_THRIFT_PORT'))
     yamlDict['batchWarnThreshold'] = int(os.environ.get('SCYLLA_BATCH_SIZE_WARN'))
     yamlDict['batchFailThreshold'] = int(os.environ.get('SCYLLA_BATCH_SIZE_FAIL'))
-    yamlDict['partitioner'] = os.environ.get('SCYLLA_PARTITIONER')
-    yamlDict['cqlLoadBalance'] = os.environ.get('SCYLLA_CQLLOADBALANCE')
     yamlDict['authenticator'] = os.environ.get('SCYLLA_AUTHENTICATOR')
     yamlDict['username'] = os.environ.get('SCYLLA_USERNAME')
     yamlDict['password'] = os.environ.get('SCYLLA_PASSWORD')
